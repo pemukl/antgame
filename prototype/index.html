@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Hearth &amp; Hollow — a two-player humming prototype</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; background: #0c0a14;
+    color: #e8e4d8; font-family: ui-rounded, "Segoe UI", system-ui, sans-serif;
+    overflow: hidden; height: 100%;
+  }
+  #wrap {
+    position: relative;
+    width: 1024px; height: 640px;
+    margin: 12px auto;
+    box-shadow: 0 0 40px #000a;
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  canvas { display: block; background: #000; }
+  #controls {
+    position: absolute; top: 8px; left: 8px;
+    background: rgba(0,0,0,0.4);
+    padding: 6px 10px;
+    font-size: 12px;
+    line-height: 1.4;
+    border-radius: 4px;
+    pointer-events: none;
+    max-width: 360px;
+  }
+  #controls b { color: #ffd089; }
+  #overlay {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(0,0,0,0.78);
+    font-size: 22px;
+    text-align: center;
+    flex-direction: column;
+    gap: 16px;
+    cursor: pointer;
+  }
+  #overlay.hidden { display: none; }
+  #overlay .sub { font-size: 14px; opacity: 0.8; max-width: 540px; line-height: 1.5; }
+  #overlay .key { background: #2a2438; padding: 2px 6px; border-radius: 4px; font-family: ui-monospace, monospace; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="1024" height="640"></canvas>
+  <div id="controls">
+    <b>Golem (mouse):</b> click forest to walk &middot; hold over item to reach &middot; release over chute to drop in chest<br/>
+    <b>Sprite (keys):</b> <span class="key">W A S D</span> move &middot; <span class="key">E</span> toggle nearby rune &middot; walk over hearth carrying a seed to feed it<br/>
+    <span style="opacity:0.6"><span class="key">R</span> restart level</span>
+  </div>
+  <div id="overlay">
+    <div>Hearth &amp; Hollow</div>
+    <div class="sub">
+      A two-player humming prototype. One of you is the lumbering stone <b>Golem</b> (mouse).
+      The other is the tiny <b>Fire Sprite</b> living in its chest (<span class="key">WASD</span> + <span class="key">E</span>).
+      Walk the misty forest, rescue lost animals, keep the hearth fed.
+    </div>
+    <div class="sub" style="opacity:0.6">click to begin</div>
+  </div>
+</div>
+<script src="game.js"></script>
+</body>
+</html>
