@@ -20,14 +20,17 @@
   canvas { display: block; background: #000; }
   #controls {
     position: absolute; top: 8px; left: 8px;
-    background: rgba(0,0,0,0.4);
-    padding: 6px 10px;
-    font-size: 12px;
-    line-height: 1.4;
+    background: rgba(0,0,0,0.35);
+    padding: 5px 9px;
+    font-size: 11px;
+    line-height: 1.35;
     border-radius: 4px;
     pointer-events: none;
-    max-width: 360px;
+    max-width: 320px;
+    transition: opacity 0.6s ease 6s;
   }
+  #wrap.playing #controls { opacity: 0.35; }
+  #wrap.playing #controls:hover { opacity: 1; transition: none; }
   #controls b { color: #ffd089; }
   #overlay {
     position: absolute; inset: 0;
@@ -48,16 +51,19 @@
 <div id="wrap">
   <canvas id="game" width="1024" height="640"></canvas>
   <div id="controls">
-    <b>Golem (mouse):</b> click forest to walk &middot; hold over item to reach &middot; release over chute to drop in chest<br/>
-    <b>Sprite (keys):</b> <span class="key">W A S D</span> move &middot; <span class="key">E</span> toggle nearby rune &middot; walk over hearth carrying a seed to feed it<br/>
-    <span style="opacity:0.6"><span class="key">R</span> restart level</span>
+    <b>Golem (mouse):</b> click to walk &middot; hold over item/wolf to grab &middot; release over chute to drop seeds in<br/>
+    <b>Sprite (WASD + E):</b> walk near a rune, <span class="key">E</span> to toggle &middot; carry seeds to the hearth to refuel<br/>
+    <b>Runes:</b> <span style="color:#ff9a8a">STR</span> lift/smash &middot; <span style="color:#9ad8ff">SPD</span> sprint/leap &middot; <span style="color:#ffd089">SEE</span> pierce mist, hidden seeds &middot; all 3 = ★ Bloom ★<br/>
+    <span style="opacity:0.6"><span class="key">R</span> restart &middot; <span class="key">M</span> mute</span>
   </div>
   <div id="overlay">
     <div>Hearth &amp; Hollow</div>
     <div class="sub">
-      A two-player humming prototype. One of you is the lumbering stone <b>Golem</b> (mouse).
-      The other is the tiny <b>Fire Sprite</b> living in its chest (<span class="key">WASD</span> + <span class="key">E</span>).
-      Walk the misty forest, rescue lost animals, keep the hearth fed.
+      Two-player asymmetric coop. One of you is the lumbering stone <b>Golem</b> (mouse) — strong, slow, walks the misty forest.
+      The other is the tiny <b>Fire Sprite</b> in its chest (<span class="key">WASD</span> + <span class="key">E</span>) — quick, smart, lights the runes that give the Golem its powers.
+    </div>
+    <div class="sub">
+      Wolves charge, mist blinds, gaps yawn. The sprite's runes pulse <span style="color:#ff8888">red</span> when the right one is needed next — call it out.
     </div>
     <div class="sub" style="opacity:0.6">click to begin</div>
   </div>
