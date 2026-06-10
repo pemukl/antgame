@@ -43,6 +43,20 @@
   const COLLAPSE_TIME = 8.0;          // seconds hearth at 0 before rest
   const PULSE_LOOKAHEAD = 520;        // sprite gets warning when threat is this close
   const MIST_BLIND_SPEED_MULT = 0.30;
+  // v3 additions
+  const EMBER_SPAWN_HEARTH = 75;      // hearth fuel above which embers can spit
+  const EMBER_SPAWN_INTERVAL = 1.6;   // avg seconds between embers when conditions met
+  const EMBER_SCORCH_DELAY = 4.0;     // seconds settled before scorching a rune
+  const EMBER_STOMP_DIST = 24;        // sprite-to-ember distance for stomp
+  const EMBER_STOMP_BONUS = 2;        // small fuel reward for stomping
+  const EMBER_SCORCH_LOCKOUT = 6.0;   // seconds a scorched rune is locked
+  const EMBER_SCORCH_DMG = 12;        // hearth fuel lost when ember scorches
+  const BELLOWS_DRAIN_MULT = 0.4;     // hearth drain × this while pumping
+  const BELLOWS_RANGE = 70;           // sprite-to-hearth distance to pump
+  const DIRE_WOLF_HP = 3;
+  const DIRE_WOLF_SPEED = 110;
+  const DIRE_WOLF_TRIGGER = 480;
+  const DIRE_WOLF_BITE_DMG = 30;
 
   const CHUTE_LANDING = { x: W / 2, y: SPLIT_Y + 40 };
   const HEARTH = { x: W / 2, y: SPLIT_Y + 200, r: 38 };
@@ -88,8 +102,9 @@
     push({ kind: 'gap',    x: 3060, w: 110 });
     push({ kind: 'seed',   x: 3220, hidden: false });
     push({ kind: 'boulder', x: 3300 });
-    push({ kind: 'wolf',   x: 3400, dead: false, vx: 0, state: 'lurk', spawnX: 3400 });
-    push({ kind: 'animal', x: 3460, species: '🐿' });
+    push({ kind: 'direwolf', x: 3400, dead: false, vx: 0, state: 'lurk',
+           hp: DIRE_WOLF_HP, hitT: 0, hitFlashT: 0 });
+    push({ kind: 'animal', x: 3520, species: '🐿' });
 
     // ACT 4 — finale calm
     push({ kind: 'seed',   x: 3700, hidden: false });
@@ -121,13 +136,19 @@
         jumpT: 0,                                 // animation timer for gap leaps
       },
       sprite: {
-        x: W / 2, y: SPLIT_Y + 240, carrying: null, trail: [],
+        x: W / 2, y: SPLIT_Y + 240, carrying: null, trail: [], pumping: false, pumpPhase: 0,
       },
       hearth: HEARTH_MAX * 0.7,
       hearthDeadT: 0,
+      lastFedT: 0,                                     // time of last seed feed (for ember spawn gate)
       runes: { strength: false, speed: false, sight: true },
       runePulse: { strength: 0, speed: 0, sight: 0 },   // 0..1 warning brightness
+      runeScorch: { strength: 0, speed: 0, sight: 0 }, // > 0 = seconds remaining locked
       chestSeeds: [],
+      embers: [],                                      // {x, y, vx, vy, settled, scorchIn, deadT}
+      emberCooldown: EMBER_SPAWN_INTERVAL * 0.7,
+      celebrateT: 0,
+      celebrateParticles: [],
       world: buildWorld(),
       rescued: 0,
       totalAnimals: 0,
@@ -195,6 +216,15 @@
       case 'leap':      blip(330, 0.18, 'sine', 0.05, 660); break;
       case 'collapse':  blip(140, 0.6, 'sawtooth', 0.1, 50); break;
       case 'win':       chord([523, 659, 784, 1047], 0.9, 'sine', 0.08); break;
+      // v3
+      case 'ember':     blip(880, 0.10, 'square', 0.05, 1320); break;
+      case 'stomp':     blip(260, 0.10, 'sine', 0.06, 130); break;
+      case 'scorch':    blip(180, 0.40, 'sawtooth', 0.10, 80); break;
+      case 'bellows':   blip(420, 0.10, 'sine', 0.04, 520); break;
+      case 'direwolf':  chord([110, 138, 165], 0.55, 'sawtooth', 0.10); break;
+      case 'direhit':   blip(150, 0.18, 'square', 0.10, 90); break;
+      case 'direkill':  chord([147, 110, 82], 0.7, 'sawtooth', 0.12); break;
+      case 'fanfare':   chord([523, 659, 784, 1047, 1319], 1.4, 'triangle', 0.07); break;
     }
   }
 
@@ -236,8 +266,13 @@
     if (k === 'e') state.eEdge = true;
     if (k === 'r') reset();
     if (k === 'm') toggleMute();
+    if (k === ' ') e.preventDefault();              // don't scroll page on space
   });
-  window.addEventListener('keyup', e => { state.keys.delete(e.key.toLowerCase()); });
+  window.addEventListener('keyup', e => {
+    const k = e.key.toLowerCase();
+    state.keys.delete(k);
+    if (k === ' ' || k === 'spacebar') state.keys.delete(' ');
+  });
 
   let muted = false;
   function toggleMute() {
@@ -266,16 +301,22 @@
     state.bloomFlashT = Math.max(0, state.bloomFlashT - dt);
     if (!state.started) return;
 
-    if (state.ended) { state.endT += dt; return; }
+    if (state.ended) {
+      state.endT += dt;
+      tickCelebration(dt);            // keep particles & dancing alive after win
+      return;
+    }
 
     tickSprite(dt);
     tickRunes(dt);
     tickHearth(dt);
+    tickEmbers(dt);
     tickWolves(dt);
     tickGolem(dt);
     tickArm(dt);
     tickPulses(dt);
     tickChestSeeds(dt);
+    tickCelebration(dt);
     tickCamera();
     if (state.flash) { state.flash.t -= dt; if (state.flash.t <= 0) state.flash = null; }
     checkEnd();
@@ -283,14 +324,35 @@
 
   function tickSprite(dt) {
     const s = state.sprite;
+
+    // bellows: SPACE held + within range of hearth + carrying nothing
+    const nearHearth = dist(s.x, s.y, HEARTH.x, HEARTH.y) < BELLOWS_RANGE;
+    const wasPumping = s.pumping;
+    s.pumping = state.keys.has(' ') && nearHearth && !s.carrying && state.hearth > 0;
+    if (s.pumping && !wasPumping) play('bellows');
+    if (s.pumping) s.pumpPhase += dt * 7;
+
     let vx = 0, vy = 0;
-    if (state.keys.has('a') || state.keys.has('arrowleft'))  vx -= 1;
-    if (state.keys.has('d') || state.keys.has('arrowright')) vx += 1;
-    if (state.keys.has('w') || state.keys.has('arrowup'))    vy -= 1;
-    if (state.keys.has('s') || state.keys.has('arrowdown'))  vy += 1;
+    if (!s.pumping) {
+      if (state.keys.has('a') || state.keys.has('arrowleft'))  vx -= 1;
+      if (state.keys.has('d') || state.keys.has('arrowright')) vx += 1;
+      if (state.keys.has('w') || state.keys.has('arrowup'))    vy -= 1;
+      if (state.keys.has('s') || state.keys.has('arrowdown'))  vy += 1;
+    }
     const m = Math.hypot(vx, vy); if (m > 0) { vx /= m; vy /= m; }
     s.x = clamp(s.x + vx * SPRITE_SPEED * dt, 30, W - 30);
     s.y = clamp(s.y + vy * SPRITE_SPEED * dt, SPLIT_Y + 24, H - 28);
+
+    // stomp embers (settled ones) by overlap
+    for (const em of state.embers) {
+      if (em.deadT > 0) continue;
+      if (dist(s.x, s.y, em.x, em.y) < EMBER_STOMP_DIST) {
+        em.deadT = 0.3;
+        state.hearth = clamp(state.hearth + EMBER_STOMP_BONUS, 0, HEARTH_MAX);
+        play('stomp');
+      }
+    }
+
     s.trail.push({ x: s.x, y: s.y, life: 0.45 });
     if (s.trail.length > 28) s.trail.shift();
     for (const p of s.trail) p.life -= dt;
@@ -309,6 +371,7 @@
     // feed
     if (s.carrying && dist(s.x, s.y, HEARTH.x, HEARTH.y) < HEARTH.r + 6) {
       state.hearth = clamp(state.hearth + SEED_VALUE, 0, HEARTH_MAX);
+      state.lastFedT = 0;
       const i = state.chestSeeds.indexOf(s.carrying);
       if (i >= 0) state.chestSeeds.splice(i, 1);
       s.carrying = null;
@@ -318,6 +381,10 @@
   }
 
   function tickRunes(dt) {
+    // decay scorch lockouts
+    for (const r of RUNES) if (state.runeScorch[r.key] > 0) {
+      state.runeScorch[r.key] = Math.max(0, state.runeScorch[r.key] - dt);
+    }
     if (state.eEdge) {
       state.eEdge = false;
       const s = state.sprite;
@@ -327,7 +394,10 @@
         if (d < bestD) { bestD = d; best = r; }
       }
       if (best) {
-        if (state.hearth <= 0 && !state.runes[best.key]) {
+        if (state.runeScorch[best.key] > 0) {
+          flash(`${best.label} scorched — wait`, 0.7);
+          play('bump');
+        } else if (state.hearth <= 0 && !state.runes[best.key]) {
           flash('hearth is cold');
           play('bump');
         } else {
@@ -342,6 +412,8 @@
   }
 
   function tickHearth(dt) {
+    state.lastFedT += dt;
+
     // sum of lit-rune burn rates
     let drain = 0;
     for (const r of RUNES) if (state.runes[r.key]) drain += BURN[r.key];
@@ -352,49 +424,150 @@
       state.bloomFlashT = 1.2;
       flash('★ BLOOM MODE — burn brightly!', 1.4);
       play('bloom');
+      // particle burst around the golem (forest-space)
+      for (let i = 0; i < 22; i++) {
+        const ang = Math.random() * Math.PI * 2;
+        const spd = 80 + Math.random() * 120;
+        state.celebrateParticles.push({
+          x: state.golem.x + Math.cos(ang) * 18,
+          y: GROUND_Y - 60 + Math.sin(ang) * 18,
+          vx: Math.cos(ang) * spd,
+          vy: Math.sin(ang) * spd - 40,
+          life: 0.8 + Math.random() * 0.6,
+          hue: 38 + Math.random() * 16,
+        });
+      }
     } else if (!allLit && state.bloomMode) {
       state.bloomMode = false;
     }
     if (state.bloomMode) drain += BLOOM_DRAIN;
+    // bellows pump halves drain
+    if (state.sprite.pumping) drain *= BELLOWS_DRAIN_MULT;
 
     state.hearth = clamp(state.hearth - drain * dt, 0, HEARTH_MAX);
 
+    // ember spit: when well-fueled and recently fed, embers occasionally pop out
+    state.emberCooldown -= dt;
+    if (state.hearth > EMBER_SPAWN_HEARTH && state.emberCooldown <= 0 && state.lastFedT < 6.0) {
+      spitEmber();
+      state.emberCooldown = EMBER_SPAWN_INTERVAL * (0.7 + Math.random() * 0.6);
+    }
+
     if (state.hearth <= 0) {
-      // force runes off and start collapse timer
       if (state.runes.strength || state.runes.speed || state.runes.sight) {
         flash('hearth out — runes dim');
         play('collapse');
       }
       state.runes.strength = state.runes.speed = state.runes.sight = false;
       state.bloomMode = false;
+      state.sprite.pumping = false;
       state.hearthDeadT += dt;
     } else {
       state.hearthDeadT = 0;
     }
   }
 
+  function spitEmber() {
+    const ang = -Math.PI / 2 + (Math.random() - 0.5) * 1.6;
+    const speed = 220 + Math.random() * 80;
+    state.embers.push({
+      x: HEARTH.x + (Math.random() - 0.5) * 14,
+      y: HEARTH.y - 8,
+      vx: Math.cos(ang) * speed,
+      vy: Math.sin(ang) * speed,
+      settled: false,
+      landY: SPLIT_Y + 70 + Math.random() * (H - SPLIT_Y - 110),
+      scorchIn: EMBER_SCORCH_DELAY,
+      deadT: 0,
+      sparkPhase: Math.random() * Math.PI * 2,
+    });
+    play('ember');
+  }
+
+  function tickEmbers(dt) {
+    for (const em of state.embers) {
+      em.sparkPhase += dt * 12;
+      if (em.dying) { em.fadeT -= dt; continue; }
+      if (!em.settled) {
+        em.vy += 800 * dt;
+        em.x += em.vx * dt;
+        em.y += em.vy * dt;
+        if (em.y >= em.landY || em.x < 30 || em.x > W - 30) {
+          em.settled = true;
+          em.y = Math.min(em.y, H - 32);
+          em.vx = em.vy = 0;
+        }
+      } else {
+        em.scorchIn -= dt;
+        if (em.scorchIn <= 0) {
+          let best = null, bestD = Infinity;
+          for (const r of RUNES) {
+            const d = dist(em.x, em.y, r.x, r.y);
+            if (d < bestD) { bestD = d; best = r; }
+          }
+          if (best) {
+            state.runes[best.key] = false;
+            state.runeScorch[best.key] = EMBER_SCORCH_LOCKOUT;
+            state.hearth = Math.max(0, state.hearth - EMBER_SCORCH_DMG);
+            state.shake = Math.max(state.shake, 0.5);
+            flash(`${best.label} scorched!`, 1.2);
+            play('scorch');
+          }
+          em.dying = true; em.fadeT = 0.35;
+        }
+      }
+    }
+    // dt-based stomp marker triggers dying when tickSprite set deadT
+    for (const em of state.embers) {
+      if (em.deadT > 0 && !em.dying) { em.dying = true; em.fadeT = 0.3; em.stomped = true; }
+    }
+    state.embers = state.embers.filter(e => !e.dying || e.fadeT > 0);
+  }
+
   function tickWolves(dt) {
     for (const w of state.world) {
-      if (w.kind !== 'wolf' || w.dead) continue;
-      const distToGolem = w.x - state.golem.x;
-      const abs = Math.abs(distToGolem);
-      if (w.state === 'lurk' && abs < WOLF_TRIGGER_DIST) {
-        w.state = 'chase';
-        play('wolf');
-      }
-      if (w.state === 'chase') {
-        const dir = -Math.sign(distToGolem);
-        w.x += dir * WOLF_SPEED * dt;
-        w.vx = dir * WOLF_SPEED;
-        // bite
-        if (abs < WOLF_BITE_DIST && state.golem.restT <= 0) {
-          state.hearth = Math.max(0, state.hearth - WOLF_BITE_DMG);
-          state.shake = 0.9;
-          w.dead = true; w.state = 'dead';
-          flash('wolf bit the hearth!', 1.4);
-          play('bite');
+      if (w.kind === 'wolf' && !w.dead) {
+        const distToGolem = w.x - state.golem.x;
+        const abs = Math.abs(distToGolem);
+        if (w.state === 'lurk' && abs < WOLF_TRIGGER_DIST) { w.state = 'chase'; play('wolf'); }
+        if (w.state === 'chase') {
+          const dir = -Math.sign(distToGolem);
+          w.x += dir * WOLF_SPEED * dt;
+          w.vx = dir * WOLF_SPEED;
+          if (abs < WOLF_BITE_DIST && state.golem.restT <= 0) {
+            state.hearth = Math.max(0, state.hearth - WOLF_BITE_DMG);
+            state.shake = 0.9;
+            w.dead = true; w.state = 'dead';
+            flash('wolf bit the hearth!', 1.4);
+            play('bite');
+          }
         }
-        // golem with STR + mouse-over → kill (handled in arm logic)
+      }
+      if (w.kind === 'direwolf' && !w.dead) {
+        const distToGolem = w.x - state.golem.x;
+        const abs = Math.abs(distToGolem);
+        if (w.state === 'lurk' && abs < DIRE_WOLF_TRIGGER) {
+          w.state = 'chase';
+          play('direwolf');
+          flash('DIRE WOLF — only Bloom can fell it in one!', 2.4);
+        }
+        if (w.state === 'chase') {
+          const dir = -Math.sign(distToGolem);
+          w.x += dir * DIRE_WOLF_SPEED * dt;
+          w.vx = dir * DIRE_WOLF_SPEED;
+          // bite, but back off briefly after each bite (so it doesn't bite-spam)
+          if (w.hitT > 0) w.hitT = Math.max(0, w.hitT - dt);
+          if (w.hitFlashT > 0) w.hitFlashT = Math.max(0, w.hitFlashT - dt);
+          if (abs < WOLF_BITE_DIST + 8 && state.golem.restT <= 0 && w.hitT <= 0) {
+            state.hearth = Math.max(0, state.hearth - DIRE_WOLF_BITE_DMG);
+            state.shake = 1.2;
+            w.hitT = 1.2;                              // dire wolf bite-cooldown to avoid instakill
+            // dire wolf hops back a bit
+            w.x += -dir * 60;
+            flash('DIRE WOLF BIT THE HEARTH!', 1.4);
+            play('bite');
+          }
+        }
       }
     }
   }
@@ -485,6 +658,10 @@
             const d = dist(g.x, GROUND_Y - 40, it.x, GROUND_Y - 10);
             const mc = dist(mw.x, mw.y, it.x, GROUND_Y - 10);
             if (d < bestD && mc < 100) { bestD = d; best = it; }
+          } else if (it.kind === 'direwolf' && !it.dead) {
+            const d = dist(g.x, GROUND_Y - 40, it.x, GROUND_Y - 10);
+            const mc = dist(mw.x, mw.y, it.x, GROUND_Y - 10);
+            if (d < bestD && mc < 110) { bestD = d; best = it; }
           }
         }
         g.armTarget = best;
@@ -519,6 +696,39 @@
         pulse('strength');
         flash('needs STR — wolf!', 0.9);
         play('bump');
+      }
+      return;
+    }
+    if (item.kind === 'direwolf') {
+      if (!state.runes.strength) {
+        item.wobble = 0.6;
+        g.bumpT = 0.25;
+        pulse('strength');
+        flash('DIRE WOLF — needs STR!', 1.0);
+        play('bump');
+        return;
+      }
+      // bloom = one-shot. otherwise 3 hits and the wolf hops back briefly.
+      if (state.bloomMode) {
+        item.dead = true; item.state = 'dead'; item.hp = 0;
+        state.shake = 1.4;
+        flash('★ DIRE WOLF FELLED ★', 2.0);
+        play('direkill');
+      } else {
+        item.hp = Math.max(0, item.hp - 1);
+        item.hitFlashT = 0.4;
+        item.wobble = 0.3;
+        state.shake = 0.7;
+        // hop back so the golem isn't grabbing it mid-bite
+        item.x += -state.golem.facing * 90;
+        play('direhit');
+        if (item.hp <= 0) {
+          item.dead = true; item.state = 'dead';
+          flash('the DIRE WOLF falls!', 2.0);
+          play('direkill');
+        } else {
+          flash(`DIRE WOLF — ${item.hp} hp left`, 1.0);
+        }
       }
       return;
     }
@@ -611,6 +821,12 @@
           state.runePulse.strength = Math.max(state.runePulse.strength, intensity * 0.4);
         }
       }
+      if (it.kind === 'direwolf' && !it.dead) {
+        // dire wolf wants BLOOM (all three). pulse hard on all that aren't lit.
+        if (!state.runes.strength) state.runePulse.strength = Math.max(state.runePulse.strength, intensity);
+        if (!state.runes.speed)    state.runePulse.speed    = Math.max(state.runePulse.speed,    intensity * 0.7);
+        if (!state.runes.sight)    state.runePulse.sight    = Math.max(state.runePulse.sight,    intensity * 0.7);
+      }
       if (it.kind === 'mist' && !state.runes.sight) {
         state.runePulse.sight = Math.max(state.runePulse.sight, intensity);
       }
@@ -639,6 +855,32 @@
     state.camX = clamp(state.golem.x - W / 2, 0, WORLD_END - W);
   }
 
+  function tickCelebration(dt) {
+    // particle physics always runs (bloom bursts use the same pool)
+    for (const p of state.celebrateParticles) {
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.vy += 25 * dt;
+      p.life -= dt;
+    }
+    state.celebrateParticles = state.celebrateParticles.filter(p => p.life > 0);
+
+    if (state.ended !== 'won') return;
+    state.celebrateT += dt;
+    if (state.celebrateT < 6 && Math.random() < dt * 18) {
+      const ang = Math.random() * Math.PI * 2;
+      const r = 40 + Math.random() * 50;
+      state.celebrateParticles.push({
+        x: (WORLD_END - 60) + Math.cos(ang) * r,
+        y: GROUND_Y - 110 + Math.sin(ang) * r,
+        vx: (Math.random() - 0.5) * 30,
+        vy: -30 - Math.random() * 40,
+        life: 2.0 + Math.random() * 1.0,
+        hue: 36 + Math.random() * 20,
+      });
+    }
+  }
+
   function checkEnd() {
     if (state.golem.restT <= 0 && state.hearthDeadT >= COLLAPSE_TIME) {
       state.golem.restT = 99;
@@ -649,7 +891,7 @@
     if (!state.ended && state.golem.x >= WORLD_END - 90) {
       state.ended = 'won';
       flash(`the forest hums — ${state.rescued} / ${state.totalAnimals} friends home`, 5.0);
-      play('win');
+      play('fanfare');
     }
   }
 
@@ -719,6 +961,17 @@
     // Spirit tree
     drawSpiritTree();
 
+    // celebration / bloom particles (world-space)
+    for (const p of state.celebrateParticles) {
+      const sx = p.x - state.camX;
+      if (sx < -20 || sx > W + 20) continue;
+      const a = clamp(p.life / 1.5, 0, 1);
+      ctx.fillStyle = `hsla(${p.hue}, 90%, 70%, ${a})`;
+      ctx.beginPath(); ctx.arc(sx, p.y, 2.5, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = `hsla(${p.hue + 10}, 100%, 86%, ${a * 0.7})`;
+      ctx.beginPath(); ctx.arc(sx, p.y, 1.2, 0, Math.PI * 2); ctx.fill();
+    }
+
     // World items (excluding mist/gaps already drawn or to be drawn elsewhere)
     for (const it of state.world) {
       if (it.kind === 'mist' || it.kind === 'gap') continue;
@@ -778,11 +1031,15 @@
   function drawTreeBand(par, color, minH, maxH) {
     ctx.fillStyle = color;
     const off = -(state.camX * par) % 160;
+    // sway: scale with parallax (closer trees sway more)
+    const swayAmp = 4 * par;
+    const swayBase = state.t * 0.9;
     for (let i = -1; i < W / 160 + 2; i++) {
       const x = i * 160 + off;
       const h = minH + ((i * 53) % (maxH - minH));
+      const tip = swayAmp * Math.sin(swayBase + i * 0.7);
       ctx.beginPath();
-      ctx.moveTo(x, GROUND_Y); ctx.lineTo(x + 40, GROUND_Y - h); ctx.lineTo(x + 80, GROUND_Y);
+      ctx.moveTo(x, GROUND_Y); ctx.lineTo(x + 40 + tip, GROUND_Y - h); ctx.lineTo(x + 80, GROUND_Y);
       ctx.closePath(); ctx.fill();
     }
   }
@@ -880,18 +1137,91 @@
     } else if (it.kind === 'animal') {
       const dim = sightOn ? 1.0 : 0.5;
       if (it.state === 'rescued') {
-        const halo = ctx.createRadialGradient(0, 0, 2, 0, 0, 18);
+        const halo = ctx.createRadialGradient(0, 0, 2, 0, 0, 22);
         halo.addColorStop(0, 'rgba(255,235,170,0.7)');
         halo.addColorStop(1, 'rgba(255,235,170,0)');
-        ctx.fillStyle = halo; ctx.fillRect(-20, -20, 40, 40);
+        ctx.fillStyle = halo; ctx.fillRect(-22, -22, 44, 44);
+      }
+      let hopY = 0;
+      if (it.state === 'rescued' && state.ended === 'won') {
+        const phase = state.t * 5 + it.x * 0.013;
+        hopY = -Math.abs(Math.sin(phase)) * 10;
       }
       ctx.globalAlpha = dim;
-      ctx.font = '24px serif'; ctx.textAlign = 'center';
-      ctx.fillText(it.species || '🐾', 0, 0);
+      ctx.font = '26px serif'; ctx.textAlign = 'center';
+      ctx.fillText(it.species || '🐾', 0, hopY);
       ctx.globalAlpha = 1;
     }
     ctx.restore();
     if (it.kind === 'wolf') drawWolf(it, sx);
+    if (it.kind === 'direwolf') drawDireWolf(it, sx);
+  }
+
+  function drawDireWolf(w, sx) {
+    if (w.dead) {
+      ctx.save();
+      ctx.translate(sx, GROUND_Y - 6);
+      ctx.globalAlpha = 0.65;
+      ctx.fillStyle = '#2a1714';
+      ctx.beginPath(); ctx.ellipse(0, 0, 38, 12, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#4a3328';
+      ctx.fillRect(-34, -8, 68, 8);
+      ctx.globalAlpha = 1;
+      ctx.restore();
+      return;
+    }
+    ctx.save();
+    ctx.translate(sx, GROUND_Y - 8);
+    const dir = w.vx < 0 ? -1 : 1;
+    ctx.scale(dir, 1);
+    // shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.beginPath(); ctx.ellipse(0, 8, 40, 6, 0, 0, Math.PI * 2); ctx.fill();
+    // body (larger, darker)
+    const flash = w.hitFlashT > 0 ? Math.sin(w.hitFlashT * 30) * 0.5 + 0.5 : 0;
+    ctx.fillStyle = flash > 0.3 ? '#a04040' : '#2a1a18';
+    ctx.beginPath(); ctx.ellipse(0, -16, 34, 18, 0, 0, Math.PI * 2); ctx.fill();
+    // head
+    ctx.fillStyle = flash > 0.3 ? '#a85050' : '#3a2622';
+    ctx.beginPath(); ctx.arc(30, -22, 13, 0, Math.PI * 2); ctx.fill();
+    // ears
+    ctx.beginPath();
+    ctx.moveTo(22, -34); ctx.lineTo(26, -42); ctx.lineTo(30, -30); ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(31, -34); ctx.lineTo(36, -44); ctx.lineTo(40, -30); ctx.fill();
+    // glowing eye
+    const eyeGlow = 0.7 + 0.3 * Math.sin(state.t * 8);
+    ctx.fillStyle = `rgba(255,90,40,${eyeGlow})`;
+    ctx.beginPath(); ctx.arc(34, -22, 3, 0, Math.PI * 2); ctx.fill();
+    // bared teeth
+    ctx.fillStyle = '#e8d8a0';
+    ctx.fillRect(36, -14, 5, 4);
+    // legs
+    const step = Math.sin(state.t * 16 + w.x * 0.01) * 4;
+    ctx.fillStyle = '#1f1311';
+    ctx.fillRect(-22, -4, 5, 10 + step);
+    ctx.fillRect(-6, -4, 5, 10 - step);
+    ctx.fillRect(12, -4, 5, 10 + step);
+    ctx.fillRect(22, -4, 5, 10 - step);
+    // bushy tail
+    ctx.fillStyle = '#2a1a18';
+    ctx.beginPath();
+    ctx.ellipse(-32, -18, 11, 6, Math.sin(state.t * 7) * 0.4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+
+    // HP pips above its head (when triggered)
+    if (w.state === 'chase' && !w.dead) {
+      const baseY = GROUND_Y - 70;
+      for (let i = 0; i < DIRE_WOLF_HP; i++) {
+        ctx.fillStyle = i < w.hp ? '#ff7a4a' : '#3a1a14';
+        ctx.beginPath();
+        ctx.arc(sx - 18 + i * 14, baseY, 4.5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = '#2a1010'; ctx.lineWidth = 1;
+        ctx.stroke();
+      }
+    }
   }
 
   function drawWolf(w, sx) {
@@ -1086,6 +1416,7 @@
 
     drawHearth();
     for (const r of RUNES) drawRune(r);
+    for (const em of state.embers) drawEmber(em);
     for (const seed of state.chestSeeds) {
       if (state.sprite.carrying === seed) continue;
       drawChestSeed(seed.x, seed.y, seed.settled);
@@ -1096,7 +1427,85 @@
       ctx.beginPath(); ctx.arc(p.x, p.y, 5 * p.life, 0, Math.PI * 2); ctx.fill();
     }
     drawSprite();
+    drawBellowsHint();
     if (state.sprite.carrying) drawChestSeed(state.sprite.carrying.x, state.sprite.carrying.y, true);
+  }
+
+  function drawEmber(em) {
+    const dying = em.dying;
+    const fade = dying ? clamp(em.fadeT / 0.35, 0, 1) : 1;
+    if (!em.settled) {
+      // streaking ember in mid-air
+      const len = 12;
+      ctx.strokeStyle = `rgba(255,140,40,${0.8 * fade})`;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(em.x - em.vx * 0.04, em.y - em.vy * 0.04);
+      ctx.lineTo(em.x, em.y);
+      ctx.stroke();
+      ctx.fillStyle = `rgba(255,210,140,${fade})`;
+      ctx.beginPath(); ctx.arc(em.x, em.y, 3, 0, Math.PI * 2); ctx.fill();
+      return;
+    }
+    // settled — pulsing scorch timer ring
+    const danger = clamp(1 - em.scorchIn / EMBER_SCORCH_DELAY, 0, 1);
+    const ringR = 14 + danger * 8;
+    const ringAlpha = (0.25 + 0.45 * danger) * fade;
+    if (!dying) {
+      ctx.strokeStyle = `rgba(255,80,40,${ringAlpha})`;
+      ctx.lineWidth = 2;
+      ctx.setLineDash([4, 3]);
+      ctx.beginPath(); ctx.arc(em.x, em.y, ringR, 0, Math.PI * 2); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    // glow & spark
+    const flick = 0.8 + 0.2 * Math.sin(em.sparkPhase);
+    const halo = ctx.createRadialGradient(em.x, em.y, 1, em.x, em.y, 16);
+    halo.addColorStop(0, `rgba(255,150,60,${0.8 * fade * flick})`);
+    halo.addColorStop(1, 'rgba(255,150,60,0)');
+    ctx.fillStyle = halo;
+    ctx.fillRect(em.x - 16, em.y - 16, 32, 32);
+    ctx.fillStyle = `rgba(255,180,80,${fade * flick})`;
+    ctx.beginPath(); ctx.arc(em.x, em.y, 4, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = `rgba(255,80,40,${fade})`;
+    ctx.beginPath(); ctx.arc(em.x, em.y, 2, 0, Math.PI * 2); ctx.fill();
+    if (dying && em.stomped) {
+      // stomp puff
+      ctx.strokeStyle = `rgba(255,200,140,${fade * 0.7})`;
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(em.x, em.y, (1 - fade) * 18 + 4, 0, Math.PI * 2); ctx.stroke();
+    }
+  }
+
+  function drawBellowsHint() {
+    const s = state.sprite;
+    if (s.carrying) return;
+    const nearHearth = dist(s.x, s.y, HEARTH.x, HEARTH.y) < BELLOWS_RANGE;
+    if (!nearHearth || state.hearth <= 0) return;
+    const pulse = 0.6 + 0.4 * Math.sin(state.t * 5);
+    ctx.save();
+    if (s.pumping) {
+      // active pump: visible bellows expanding/contracting beneath the hearth
+      const phase = Math.sin(s.pumpPhase);
+      const bw = 70 + phase * 10;
+      const bh = 18 + phase * 6;
+      ctx.fillStyle = '#4a2e1a';
+      ctx.beginPath();
+      ctx.ellipse(HEARTH.x, HEARTH.y + HEARTH.r + 24, bw / 2, bh / 2, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#7a4e2c';
+      ctx.beginPath();
+      ctx.ellipse(HEARTH.x, HEARTH.y + HEARTH.r + 22, bw / 2 - 4, bh / 2 - 2, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = `rgba(255,210,140,${pulse})`;
+      ctx.font = '11px ui-rounded, sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText('PUMPING ♨', HEARTH.x, HEARTH.y + HEARTH.r + 50);
+    } else {
+      ctx.fillStyle = `rgba(255,210,140,${0.5 + 0.3 * pulse})`;
+      ctx.font = '11px ui-rounded, sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText('[SPACE] pump', HEARTH.x, HEARTH.y + HEARTH.r + 36);
+    }
+    ctx.restore();
   }
 
   function drawHearth() {
@@ -1158,8 +1567,17 @@
     const near = dist(state.sprite.x, state.sprite.y, r.x, r.y) < 110;
     const pulse = 0.7 + 0.3 * Math.sin(state.t * 4 + r.x);
     const warn = state.runePulse[r.key]; // 0..1
+    const scorch = state.runeScorch[r.key]; // > 0 = lockout seconds remaining
     ctx.save();
     ctx.translate(r.x, r.y);
+
+    if (scorch > 0) {
+      // scorched lockout — visible black smolder + red X
+      const halo = ctx.createRadialGradient(0, 0, 4, 0, 0, 60);
+      halo.addColorStop(0, `rgba(120,20,20,${0.6 + 0.2 * Math.sin(state.t * 12)})`);
+      halo.addColorStop(1, 'rgba(120,20,20,0)');
+      ctx.fillStyle = halo; ctx.fillRect(-60, -60, 120, 120);
+    }
 
     // warning glow (red pulse) — the sprite's privileged signal
     if (warn > 0.05 && !lit) {
@@ -1176,17 +1594,30 @@
       halo.addColorStop(1, 'rgba(255,180,80,0)');
       ctx.fillStyle = halo; ctx.fillRect(-78, -78, 156, 156);
     }
-    ctx.fillStyle = '#241914';
+    ctx.fillStyle = scorch > 0 ? '#160808' : '#241914';
     ctx.beginPath(); ctx.arc(0, 0, 28, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = lit ? '#3a2616' : '#1a120e';
+    ctx.fillStyle = scorch > 0 ? '#0a0404' : (lit ? '#3a2616' : '#1a120e');
     ctx.beginPath(); ctx.arc(0, 0, 23, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = lit ? `rgba(255,200,110,${pulse})` : '#5a4a3c';
+    ctx.fillStyle = scorch > 0 ? '#5a2020' : (lit ? `rgba(255,200,110,${pulse})` : '#5a4a3c');
     ctx.font = '24px serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     ctx.fillText(r.glyph, 0, 1);
-    ctx.fillStyle = lit ? '#ffd089' : (warn > 0.1 ? '#ff9a8a' : '#7d6a55');
+    ctx.fillStyle = lit ? '#ffd089' : (scorch > 0 ? '#ff5a4a' : (warn > 0.1 ? '#ff9a8a' : '#7d6a55'));
     ctx.font = '10px ui-rounded, sans-serif';
     ctx.fillText(r.label, 0, 40);
-    if (near) {
+    if (scorch > 0) {
+      // X mark + countdown ring
+      ctx.strokeStyle = '#ff6a5a'; ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(-12, -12); ctx.lineTo(12, 12);
+      ctx.moveTo(12, -12); ctx.lineTo(-12, 12);
+      ctx.stroke();
+      const ringFrac = scorch / EMBER_SCORCH_LOCKOUT;
+      ctx.strokeStyle = 'rgba(255,90,90,0.7)'; ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(0, 0, 30, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * ringFrac);
+      ctx.stroke();
+    }
+    if (near && scorch <= 0) {
       ctx.strokeStyle = '#ffd089'; ctx.setLineDash([3, 3]);
       ctx.beginPath(); ctx.arc(0, 0, 34, 0, Math.PI * 2); ctx.stroke();
       ctx.setLineDash([]);
@@ -1215,18 +1646,28 @@
   function drawSprite() {
     const s = state.sprite;
     const flick = 0.85 + 0.15 * Math.sin(state.t * 18);
-    const halo = ctx.createRadialGradient(s.x, s.y, 2, s.x, s.y, 30);
+    let dx = 0, dy = 0;
+    if (state.ended === 'won') {
+      // float up & wobble through the chute
+      dy = -clamp(state.endT * 38, 0, 220) + Math.sin(state.t * 2) * 6;
+      dx = Math.sin(state.t * 1.4) * 18;
+    } else if (s.pumping) {
+      // pulse while pumping
+      dy = Math.sin(s.pumpPhase) * 3;
+    }
+    const x = s.x + dx, y = s.y + dy;
+    const halo = ctx.createRadialGradient(x, y, 2, x, y, 30);
     halo.addColorStop(0, `rgba(255,210,130,${0.85 * flick})`);
     halo.addColorStop(1, 'rgba(255,210,130,0)');
-    ctx.fillStyle = halo; ctx.fillRect(s.x - 30, s.y - 30, 60, 60);
+    ctx.fillStyle = halo; ctx.fillRect(x - 30, y - 30, 60, 60);
     ctx.fillStyle = `rgba(255,160,60,${flick})`;
-    ctx.beginPath(); ctx.ellipse(s.x, s.y, 6, 9, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(x, y, 6, 9, 0, 0, Math.PI * 2); ctx.fill();
     ctx.fillStyle = `rgba(255,255,200,${flick})`;
-    ctx.beginPath(); ctx.ellipse(s.x, s.y - 3, 3, 5, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(x, y - 3, 3, 5, 0, 0, Math.PI * 2); ctx.fill();
     for (let i = 0; i < 3; i++) {
       const a = state.t * 6 + i * 2.1;
       ctx.fillStyle = `rgba(255,230,150,${0.6 * flick})`;
-      ctx.beginPath(); ctx.arc(s.x + Math.cos(a) * 11, s.y + Math.sin(a) * 11, 1.4, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(x + Math.cos(a) * 11, y + Math.sin(a) * 11, 1.4, 0, Math.PI * 2); ctx.fill();
     }
   }
 
@@ -1289,6 +1730,7 @@
       const tx = W / 2 - trackW / 2 + (it.x / WORLD_END) * trackW;
       let glyph = null, color = '#e8e4d8';
       if (it.kind === 'wolf' && !it.dead) { glyph = '◢'; color = '#ff8888'; }
+      if (it.kind === 'direwolf' && !it.dead) { glyph = '◆'; color = '#ff4040'; }
       if (it.kind === 'mist') { glyph = '~'; color = '#cfe4dc'; }
       if (it.kind === 'gap') { glyph = '∨'; color = '#b0c8d4'; }
       if (it.kind === 'boulder' && it.state === 'idle') { glyph = '●'; color = '#aaa'; }
@@ -1325,24 +1767,31 @@
 
   function drawEndScreen() {
     ctx.save();
-    ctx.fillStyle = 'rgba(0,0,0,0.55)';
-    ctx.fillRect(W / 2 - 240, H / 2 - 80, 480, 160);
-    ctx.fillStyle = '#ffe9a8';
-    ctx.font = '22px ui-rounded, sans-serif'; ctx.textAlign = 'center';
     if (state.ended === 'won') {
-      ctx.fillText(`the forest hums`, W / 2, H / 2 - 20);
+      // Non-modal celebration banner — show animals dancing & sprite floating
+      const bannerY = 90;
+      const a = clamp(state.endT * 1.4, 0, 1);
+      ctx.fillStyle = `rgba(0,0,0,${0.35 * a})`;
+      ctx.fillRect(W / 2 - 240, bannerY - 36, 480, 80);
+      ctx.fillStyle = `rgba(255,233,168,${a})`;
+      ctx.font = '24px ui-rounded, sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText('★ the forest hums ★', W / 2, bannerY);
       ctx.font = '14px ui-rounded, sans-serif';
-      ctx.fillStyle = '#e8e4d8';
-      ctx.fillText(`${state.rescued} of ${state.totalAnimals} friends home`, W / 2, H / 2 + 12);
+      ctx.fillStyle = `rgba(232,228,216,${a})`;
+      ctx.fillText(`${state.rescued} of ${state.totalAnimals} friends home — press R to walk again`, W / 2, bannerY + 24);
     } else {
+      ctx.fillStyle = 'rgba(0,0,0,0.55)';
+      ctx.fillRect(W / 2 - 240, H / 2 - 80, 480, 160);
+      ctx.fillStyle = '#ffe9a8';
+      ctx.font = '22px ui-rounded, sans-serif'; ctx.textAlign = 'center';
       ctx.fillText(`the golem rests`, W / 2, H / 2 - 20);
       ctx.font = '14px ui-rounded, sans-serif';
       ctx.fillStyle = '#e8e4d8';
       ctx.fillText(`the hearth went cold`, W / 2, H / 2 + 12);
+      ctx.font = '12px ui-rounded, sans-serif';
+      ctx.fillStyle = '#cfc0a8';
+      ctx.fillText(`press R to walk again`, W / 2, H / 2 + 48);
     }
-    ctx.font = '12px ui-rounded, sans-serif';
-    ctx.fillStyle = '#cfc0a8';
-    ctx.fillText(`press R to walk again`, W / 2, H / 2 + 48);
     ctx.restore();
   }
 
