@@ -1,0 +1,130 @@
+html, body {
+  margin: 0; padding: 0;
+  background: #2b2420;
+  font-family: "Segoe UI", "Helvetica Neue", sans-serif;
+  color: #3a2e22;
+  display: flex; flex-direction: column; align-items: center;
+  min-height: 100vh;
+}
+.hidden { display: none !important; }
+
+#topbar, .rolebar {
+  width: min(1000px, 98vw);
+  background: #fff7e6;
+  display: flex; align-items: center; gap: 14px;
+  padding: 8px 14px; box-sizing: border-box;
+  font-size: 14px;
+}
+#topbar { margin-top: 10px; border-radius: 10px 10px 0 0; border-bottom: 1px solid #e8dcc0; flex-wrap: wrap; }
+#topbar > span { white-space: nowrap; }   /* wrap between items, never inside them */
+.rolebar { border-bottom: 1px solid #e8dcc0; flex-wrap: wrap; }
+
+#seasonPill {
+  background: #8fbf6b; padding: 3px 12px; border-radius: 12px; font-weight: 600; white-space: nowrap;
+}
+#seasonBar { width: 110px; height: 9px; background: #e5dcc5; border-radius: 5px; overflow: hidden; }
+#seasonFill { height: 100%; width: 0; background: #8fbf6b; }
+.right { margin-left: auto; color: #7a6a55; }
+.hint { color: #8a7a60; font-size: 12px; }
+.meter { display: flex; align-items: center; gap: 6px; font-size: 13px; white-space: nowrap; }
+#pherBar { width: 90px; height: 10px; background: #e5dcc5; border-radius: 5px; overflow: hidden; }
+#pherFill { height: 100%; width: 100%; background: #8a5aa8; }
+#muteBtn { background: transparent; color: #7a6a55; font-size: 15px; padding: 2px 6px; }
+
+button {
+  font: inherit; font-size: 13px;
+  background: #7ba05b; color: #fff; border: none;
+  border-radius: 8px; padding: 6px 14px; cursor: pointer;
+}
+button:hover { filter: brightness(1.08); }
+button.warn, button#recallBtn.on { background: #c05030; }
+.tool { background: #a58a5f; }
+.tool.active { background: #6b4a2f; box-shadow: 0 0 0 2px #f3d34a inset; }
+.alloc { display: flex; align-items: center; gap: 8px; font-size: 13px; margin-left: auto; }
+#allocSlider { width: 130px; }
+
+canvas {
+  /* display size is set by fitCanvas() in client.js so the whole world —
+     especially the pit — always fits on screen; this is just the pre-JS state */
+  max-width: 98vw;
+  display: block;
+  border-radius: 0 0 10px 10px;
+  box-shadow: 0 8px 30px rgba(0,0,0,.5);
+  background: #a4c47e;
+  touch-action: none;   /* drawing trails must not scroll the page */
+}
+button { touch-action: manipulation; }
+#eraseBtn.on { background: #c05030; }
+
+#toasts {
+  /* bottom of the play area — never on top of the toolbars */
+  position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+  display: flex; flex-direction: column-reverse; gap: 6px; align-items: center;
+  pointer-events: none; z-index: 40;
+}
+.toast {
+  background: rgba(70,90,50,.92); color: #fff7e6;
+  padding: 5px 16px; border-radius: 12px; font-size: 13px;
+  animation: fadein .25s ease-out;
+}
+.toast.bad { background: rgba(160,50,40,.92); }
+@keyframes fadein { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; } }
+
+#overlay {
+  position: fixed; inset: 0; z-index: 50;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(43,36,32,.85);
+}
+#overlay.hidden { display: none; }
+.panel {
+  background: #fff7e6; border-radius: 14px;
+  padding: 24px 36px; max-width: min(720px, 92vw); max-height: 92vh; overflow-y: auto; box-sizing: border-box; text-align: center;
+  box-shadow: 0 10px 40px rgba(0,0,0,.4);
+}
+.panel h1 { margin: 0 0 4px; font-size: 32px; color: #4a6b2f; }
+#gameover h1 { color: #a05030; }
+.panel .sub { margin: 0 0 16px; color: #7a6a55; }
+.roles { display: flex; gap: 16px; text-align: left; }
+.rolecard { flex: 1; border-radius: 10px; padding: 14px 18px; }
+.rolecard.bloom { background: #e5eed3; }
+.rolecard.burrow { background: #ead9c3; }
+.rolecard h2 { font-size: 18px; margin: 2px 0 8px; }
+.rolecard p { font-size: 13px; min-height: 70px; }
+.rolecard button { width: 100%; padding: 9px; font-size: 15px; }
+.rolecard .taken { color: #a05030; font-weight: 600; text-align: center; min-height: 0; }
+.tip { font-size: 13px; color: #7a6a55; margin-top: 14px; }
+
+/* ---------- responsive (kept at end of file: these must win the cascade) ---------- */
+@media (max-height: 520px) {
+  #topbar { margin-top: 0; }
+  #overlay { align-items: flex-start; }
+  .panel { margin-top: 8px; }
+}
+@media (max-width: 700px), (max-height: 520px) {
+  #topbar, .rolebar { font-size: 12px; gap: 6px 10px; padding: 4px 6px; }
+  #topbar { margin-top: 0; position: relative; padding-right: 32px; }
+  #muteBtn { position: absolute; right: 2px; top: 2px; }  /* never costs a row */
+  #seasonPill { padding: 2px 8px; font-size: 11px; }
+  #seasonBar { width: 56px; }
+  #forecast { font-size: 11px; }
+  .meter { font-size: 11px; }
+  #pherBar { width: 64px; }
+  .hint { display: none; }
+  #roleInfo { display: none; }   /* you know who you are — save a bar row */
+  button { padding: 7px 10px; font-size: 12px; }  /* still fat enough to tap */
+  .tool { padding: 7px 7px; font-size: 11px; }
+  #allocSlider { width: 90px; }
+  .alloc { margin-left: 0; font-size: 11px; }
+  .roles { flex-direction: column; }
+  .rolecard p { min-height: 0; }
+  .panel { padding: 14px 16px; }
+  .panel h1 { font-size: 22px; }
+  #toasts { top: auto; bottom: 50px; width: 96vw; }
+  .toast { font-size: 12px; text-align: center; }
+}
+
+/* portrait: toasts must never sit on the pit (bottom of Bloom's canvas).
+   Kept last so it wins over the small-screen toast rule above. */
+@media (orientation: portrait) {
+  #toasts { top: auto; bottom: 110px; }
+}

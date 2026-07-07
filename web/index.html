@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="theme-color" content="#2b2420">
+<title>Bloom &amp; Burrow</title>
+<script>
+// If served via the apache symlink (https://shnei.de/antgame/), hop over to
+// the game server itself so the API is same-origin (no mixed-content issues).
+// Keeps query params (?role=…&bot=1) intact.
+if (location.protocol === 'https:') {
+  location.replace('http://' + location.hostname + ':8420/' + location.search);
+}
+</script>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="topbar" class="hidden">
+  <span id="seasonPill">Spring · Y1</span>
+  <div id="seasonBar"><div id="seasonFill"></div></div>
+  <span id="antInfo"></span>
+  <span id="dockInfo"></span>
+  <span id="scoreInfo"></span>
+  <button id="muteBtn" title="toggle sound">🔊</button>
+  <span id="roleInfo" class="right"></span>
+</div>
+
+<div id="bloomBar" class="rolebar hidden">
+  <span id="forecast">☀️</span>
+  <span class="meter">Pheromone <div id="pherBar"><div id="pherFill"></div></div> <b id="pherVal"></b></span>
+  <button id="recallBtn">Recall foragers</button>
+  <button id="eraseBtn">✕ Erase</button>
+  <span class="hint"><b>Drag from the dock</b> (or branch off a trail) to route your ants.
+    Ants carry one 🍯 and one 🥩 at once — route through both! Traffic feeds every trail
+    it crosses; unused ones fade. Erase: right-click or the Erase button.</span>
+</div>
+
+<div id="burrowBar" class="rolebar hidden">
+  <span id="storeInfo"></span>
+  <span id="queenInfo"></span>
+  <span class="tools">
+    <button class="tool active" data-tool="dig">⛏ Dig</button>
+    <button class="tool" data-tool="stockpile">▦ Stockpile</button>
+    <button class="tool" data-tool="nursery">♥ Nursery</button>
+    <button class="tool" data-tool="gate">🚪 Gate</button>
+    <button class="tool" data-tool="egg">🥚 Egg</button>
+  </span>
+  <label class="alloc">Outside workers: <b id="allocVal">4</b>
+    <input type="range" id="allocSlider" min="0" max="12" value="4">
+  </label>
+</div>
+
+<canvas id="view" width="1000" height="620"></canvas>
+<div id="toasts"></div>
+
+<div id="overlay">
+  <div class="panel" id="lobby">
+    <h1>Bloom &amp; Burrow</h1>
+    <p class="sub">A cozy two-player ant colony — each of you sees only your half of the world.<br>
+    Open this page in a second browser (or send the link to your partner) and pick the other role.</p>
+    <div class="roles">
+      <div class="rolecard bloom">
+        <h2>🌸 Bloom</h2>
+        <p>Paint living pheromone trails from the dock to food. Traffic keeps them
+           alive; sun and rain erase them. You alone see the weather coming.</p>
+        <button id="joinBloom">Play Bloom</button>
+        <p class="taken hidden" id="bloomTaken">taken</p>
+      </div>
+      <div class="rolecard burrow">
+        <h2>⛏️ Burrow</h2>
+        <p>Dig a nest that survives real flowing water — rain pours in at the
+           entrance. Sumps, gates, storage, brood. Don't let the queen drown.</p>
+        <button id="joinBurrow">Play Burrow</button>
+        <p class="taken hidden" id="burrowTaken">taken</p>
+      </div>
+    </div>
+    <p class="tip">Sugar feeds everyone. Protein makes new ants. Everything crosses the dock. Survive the winters — score grows every year.</p>
+  </div>
+  <div class="panel hidden" id="waiting">
+    <h1>Waiting for your partner…</h1>
+    <p class="sub">The game starts as soon as both roles are filled.</p>
+    <p class="tip">Share this link: <b id="shareUrl"></b></p>
+    <button id="botBtn">🤖 Play with a bot partner</button>
+    <p class="tip">The bot plays the other role decently — perfect for testing solo.
+       A human can take over from it at any time.</p>
+  </div>
+  <div class="panel hidden" id="gameover">
+    <h1>The colony has fallen</h1>
+    <p class="sub" id="overMsg"></p>
+    <button id="restartBtn">Start a new colony</button>
+  </div>
+</div>
+
+<script src="client.js"></script>
+</body>
+</html>

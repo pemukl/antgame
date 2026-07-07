@@ -1,6 +1,15 @@
 # Bloom & Burrow (antgame)
 Two player asymmetric, cozy, seasonal city building
 
+## How it plays
+Two players share one ant colony through separate screens, joined by a single **dock**. Everything one player gathers, the other must put to use — neither can win alone.
+
+**Bloom** tends the meadow above. You paint living pheromone trails from the pit out to flowers (sugar) and carcasses (protein). Trails fade over time but are kept alive by the ants that walk them, so a busy network sustains itself while neglected routes wither. Trails branch into a shared tree, and ants carry one of each food at once — so a single clever route threaded through both a flower and a carcass outhauls two separate lines. Distant sources are richest, trading a long permanent trunk against cheap trails you keep redrawing.
+
+**Burrow** shapes the nest below. You dig tunnels and chambers against water that genuinely flows — rain pours in through the entrance, pooling and spreading through whatever you carved, so sumps, drainage shafts, and sealable gates are the difference between a dry colony and a drowned queen. You set how many workers forage versus stay home, stockpile food, and raise brood. The queen is a piece you move: eggs only mature in her warmth, so she rides up to the nursery in the growing seasons and down into a deep bunker each winter as frost creeps through the ceiling.
+
+Both worlds run on one seasonal clock. **Spring** melt and **autumn** storms flood the deep; **summer** droughts bake the surface trails; **winter** is a frozen survival sprint on stored reserves. Come through it and the colony scores another year — and the next one hits harder. Lose the queen to flood, frost, or starvation and it ends.
+
 ## Target group:
 - Couples / Friends that want to build something enjoyable with depth together
 - Niche: Cozy x Coop x Colony
