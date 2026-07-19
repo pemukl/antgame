@@ -9,7 +9,7 @@
 // If served via the apache symlink (https://shnei.de/antgame/), hop over to
 // the game server itself so the API is same-origin (no mixed-content issues).
 // Keeps query params (?role=…&bot=1) intact.
-if (location.protocol === 'https:') {
+if (location.protocol === 'https:' && location.hostname === 'shnei.de') {
   location.replace('http://' + location.hostname + ':8420/' + location.search);
 }
 </script>
