@@ -43,6 +43,8 @@ const snd = {
   milestone: () => { beep(523, 0.12, 'sine', 0.08); setTimeout(() => beep(659, 0.12, 'sine', 0.08), 120); setTimeout(() => beep(784, 0.2, 'sine', 0.08), 240); },
 };
 $('muteBtn').onclick = () => { muted = !muted; $('muteBtn').textContent = muted ? '🔇' : '🔊'; };
+$('pauseBtn').onclick = () => cmd({ type: 'pause' });
+$('resumeBtn').onclick = () => cmd({ type: 'pause' });
 document.addEventListener('pointerdown', () => {
   try { if (ac().state === 'suspended') audio.resume(); } catch (e) { /* no audio */ }
 }, { passive: true });
@@ -64,7 +66,10 @@ async function join(role) {
   $('topbar').classList.remove('hidden');
   $(myRole + 'Bar').classList.remove('hidden');
   $('roleInfo').textContent = myRole === 'bloom' ? 'You are 🌸 BLOOM' : 'You are ⛏️ BURROW';
-  $('shareUrl').textContent = location.href;
+  const partnerUrl = new URL(location.origin + location.pathname);
+  partnerUrl.searchParams.set('role', myRole === 'bloom' ? 'burrow' : 'bloom');
+  $('shareUrl').textContent = partnerUrl.href;
+  $('shareUrl').href = partnerUrl.href;
   layoutCanvas();
   setTimeout(layoutCanvas, 300);
   setTimeout(layoutCanvas, 1200);
@@ -132,12 +137,17 @@ let lastAnts = -1, lastDockTotal = -1, lastRaining = false, lastDeliverBeep = 0;
 let lastMilestone = -1, lastCard = -1, lastSeasonIdx = -1;
 function onState() {
   const s = curr;
-  const showWaiting = s.paused && !s.gameOver;
-  $('overlay').classList.toggle('hidden', !showWaiting && !s.gameOver);
+  const showWaiting = s.waiting && !s.gameOver;
+  const showPaused = s.paused && !showWaiting && !s.gameOver;
+  $('overlay').classList.toggle('hidden', !showWaiting && !showPaused && !s.gameOver);
   $('waiting').classList.toggle('hidden', !showWaiting);
+  $('pausePanel').classList.toggle('hidden', !showPaused);
   $('gameover').classList.toggle('hidden', !s.gameOver);
   $('lobby').classList.add('hidden');
   if (s.gameOver) $('overMsg').textContent = s.overMsg;
+  $('pauseBtn').textContent = s.paused ? '▶ Resume' : '⏸ Pause';
+  $('pauseBtn').classList.toggle('on', s.paused);
+  $('pauseBtn').disabled = showWaiting;
 
   const seasonName = s.seasons[s.seasonIdx].name;
   const pill = $('seasonPill');

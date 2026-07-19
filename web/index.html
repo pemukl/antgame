@@ -22,6 +22,7 @@ if (location.protocol === 'https:' && location.hostname === 'shnei.de') {
   <span id="antInfo"></span>
   <span id="dockInfo"></span>
   <span id="scoreInfo"></span>
+  <button id="pauseBtn" title="pause or resume the shared colony">⏸ Pause</button>
   <button id="muteBtn" title="toggle sound">🔊</button>
   <span id="roleInfo" class="right"></span>
 </div>
@@ -90,10 +91,15 @@ if (location.protocol === 'https:' && location.hostname === 'shnei.de') {
   <div class="panel hidden" id="waiting">
     <h1>Waiting for your partner…</h1>
     <p class="sub">The game starts as soon as both roles are filled.</p>
-    <p class="tip">Share this link: <b id="shareUrl"></b></p>
+    <p class="tip">Share this partner link: <a id="shareUrl"></a></p>
     <button id="botBtn">🤖 Play with a bot partner</button>
     <p class="tip">The bot plays the other role decently — perfect for testing solo.
        A human can take over from it at any time.</p>
+  </div>
+  <div class="panel hidden" id="pausePanel">
+    <h1>The colony is resting</h1>
+    <p class="sub">Take a breath, compare plans, and resume when both players are ready.</p>
+    <button id="resumeBtn">▶ Resume colony</button>
   </div>
   <div class="panel hidden" id="gameover">
     <h1>The colony has fallen</h1>

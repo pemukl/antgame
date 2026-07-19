@@ -21,6 +21,7 @@ const DEMO = !!process.env.DEMO;
 const SPEED = Math.max(0.1, +(process.env.SPEED || 1));
 
 let game = createGame();
+let manualPaused = false;
 // role -> { token, res (open SSE response or null), joinedAt, everConnected }
 //        | { bot: true }   — a bot partner playing that role
 // A human role is reserved from /join onward; if the browser never opens its
@@ -114,8 +115,18 @@ const server = http.createServer(async (req, res) => {
     if (body.type === 'restart') {
       if (game.gameOver) {
         game = createGame();
+        manualPaused = false;
         for (const r of ['bloom', 'burrow']) if (players[r] && players[r].bot) botStates[r] = bot.newBotState();
       }
+    } else if (body.type === 'pause') {
+      manualPaused = !manualPaused;
+      game.toasts.push({
+        id: Date.now(),
+        msg: manualPaused ? `${role.toUpperCase()} paused the colony.` : `${role.toUpperCase()} resumed the colony.`,
+        bad: false,
+        role: 'all',
+      });
+      if (game.toasts.length > 12) game.toasts.shift();
     } else if (body.type === 'bot') {
       // summon a bot partner for the OTHER role (if no human holds it)
       const other = role === 'bloom' ? 'burrow' : 'bloom';
@@ -180,7 +191,7 @@ setInterval(() => {
     if (game.toasts.length > 12) game.toasts.shift();
   }
   wasBothConnected = both;
-  if (both && !game.gameOver) {
+  if (both && !manualPaused && !game.gameOver) {
     // SPEED fast-forwards by running whole sub-ticks — same fidelity as 1×
     for (let i = 0; i < Math.round(SPEED) && !game.gameOver; i++) {
       for (const r of ['bloom', 'burrow']) {
@@ -192,7 +203,8 @@ setInterval(() => {
   }
 
   const state = publicState(game);
-  state.paused = !both;
+  state.waiting = !both;
+  state.paused = manualPaused;
   state.roles = { bloom: sb, burrow: su };
   const msg = `data: ${JSON.stringify(state)}\n\n`;
   for (const role of ['bloom', 'burrow']) {

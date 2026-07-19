@@ -38,6 +38,7 @@ button {
 }
 button:hover { filter: brightness(1.08); }
 button.warn, button#recallBtn.on { background: #c05030; }
+#pauseBtn.on { background: #c07835; }
 .tool { background: #a58a5f; }
 .tool.active { background: #6b4a2f; box-shadow: 0 0 0 2px #f3d34a inset; }
 .tool.pulse { animation: toolpulse 1.1s infinite; }
@@ -109,6 +110,7 @@ button:disabled { opacity: .55; cursor: default; }
 .rolecard button { width: 100%; padding: 9px; font-size: 15px; }
 .rolecard .taken { color: #a05030; font-weight: 600; text-align: center; min-height: 0; }
 .tip { font-size: 13px; color: #7a6a55; margin-top: 14px; }
+.tip a { color: #4a6b2f; font-weight: 700; overflow-wrap: anywhere; }
 
 /* ---------- responsive (kept at end of file: these must win the cascade) ---------- */
 @media (max-height: 520px) {
