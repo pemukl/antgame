@@ -28,24 +28,28 @@ if (location.protocol === 'https:') {
 
 <div id="bloomBar" class="rolebar hidden">
   <span id="forecast">☀️</span>
-  <span class="meter">Pheromone <div id="pherBar"><div id="pherFill"></div></div> <b id="pherVal"></b></span>
+  <span class="meter" id="segInfo" title="trail segments — each edge costs some; erase to get them back; milestones grant more"></span>
+  <button id="plantBtn" title="plant a seed from the ledge — a renewable flower AND a junction for your trails">🌰 Plant</button>
+  <button id="warnBtn" class="hidden" title="relay the forecast to Burrow — a warned colony works faster all season">📢 Warn</button>
   <button id="recallBtn">Recall foragers</button>
   <button id="eraseBtn">✕ Erase</button>
-  <span class="hint"><b>Drag from the dock</b> (or branch off a trail) to route your ants.
-    Ants carry one 🍯 and one 🥩 at once — route through both! Traffic feeds every trail
-    it crosses; unused ones fade. Erase: right-click or the Erase button.</span>
+  <span class="hint"><b>Tap a node, then another node</b> (or drag between them) to lay a trail —
+    every trail leads home to the pit. Ants carry one 🍯 and one 🥩 at once, harvesting every
+    node they pass. Trails are forever; erase to reclaim segments.</span>
 </div>
 
 <div id="burrowBar" class="rolebar hidden">
   <span id="storeInfo"></span>
   <span id="queenInfo"></span>
+  <span id="warnInfo"></span>
   <span class="tools">
     <button class="tool active" data-tool="dig">⛏ Dig</button>
     <button class="tool" data-tool="stockpile">▦ Stockpile</button>
     <button class="tool" data-tool="nursery">♥ Nursery</button>
-    <button class="tool" data-tool="gate">🚪 Gate</button>
-    <button class="tool" data-tool="egg">🥚 Egg</button>
+    <button class="tool" data-tool="garden" title="seed it (1🍯+1🥩), let it grow in comfort, tap to harvest 3🥩 — every 2nd harvest yields a 🌰 seed for Bloom">🍄 Garden</button>
+    <button class="tool" data-tool="fill" title="remove rooms and backfill tunnels">🧱 Fill</button>
   </span>
+  <button id="broodBtn" title="when ON, workers carry protein to the queen and she lays into an adjacent nursery">🍼 Brood: ON</button>
   <label class="alloc">Outside workers: <b id="allocVal">4</b>
     <input type="range" id="allocSlider" min="0" max="12" value="4">
   </label>
@@ -53,6 +57,7 @@ if (location.protocol === 'https:') {
 
 <canvas id="view" width="1000" height="620"></canvas>
 <div id="toasts"></div>
+<div id="postcard" class="hidden"></div>
 
 <div id="overlay">
   <div class="panel" id="lobby">
@@ -62,20 +67,25 @@ if (location.protocol === 'https:') {
     <div class="roles">
       <div class="rolecard bloom">
         <h2>🌸 Bloom</h2>
-        <p>Paint living pheromone trails from the dock to food. Traffic keeps them
-           alive; sun and rain erase them. You alone see the weather coming.</p>
+        <p>Grow a living trail network from the pit to the food — a tree you
+           refine, never redraw. Plant seeds into flowers that feed the colony
+           forever and anchor your trunks. You alone see the weather coming —
+           call it out and the whole colony works faster.</p>
         <button id="joinBloom">Play Bloom</button>
         <p class="taken hidden" id="bloomTaken">taken</p>
       </div>
       <div class="rolecard burrow">
         <h2>⛏️ Burrow</h2>
-        <p>Dig a nest that survives real flowing water — rain pours in at the
-           entrance. Sumps, gates, storage, brood. Don't let the queen drown.</p>
+        <p>Farm the underside: seed fungus gardens, harvest them, feed the
+           brood, and keep everyone in the comfort band between the creeping
+           frost and the rising damp. Your gardens make the seeds Bloom
+           plants above.</p>
         <button id="joinBurrow">Play Burrow</button>
         <p class="taken hidden" id="burrowTaken">taken</p>
       </div>
     </div>
-    <p class="tip">Sugar feeds everyone. Protein makes new ants. Everything crosses the dock. Survive the winters — score grows every year.</p>
+    <p class="tip">Sugar feeds everyone. Protein becomes ants. Seeds cross the dock the other way and become flowers.
+       Grow the colony together — every milestone unlocks more to build with.</p>
   </div>
   <div class="panel hidden" id="waiting">
     <h1>Waiting for your partner…</h1>

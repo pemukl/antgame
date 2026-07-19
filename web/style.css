@@ -40,6 +40,8 @@ button:hover { filter: brightness(1.08); }
 button.warn, button#recallBtn.on { background: #c05030; }
 .tool { background: #a58a5f; }
 .tool.active { background: #6b4a2f; box-shadow: 0 0 0 2px #f3d34a inset; }
+.tool.pulse { animation: toolpulse 1.1s infinite; }
+@keyframes toolpulse { 50% { filter: brightness(1.3); box-shadow: 0 0 0 2px #f3d34a; } }
 .alloc { display: flex; align-items: center; gap: 8px; font-size: 13px; margin-left: auto; }
 #allocSlider { width: 130px; }
 
@@ -55,6 +57,20 @@ canvas {
 }
 button { touch-action: manipulation; }
 #eraseBtn.on { background: #c05030; }
+#plantBtn.on { background: #6b4a2f; box-shadow: 0 0 0 2px #f3d34a inset; }
+button:disabled { opacity: .55; cursor: default; }
+
+#postcard {
+  position: fixed; top: 18%; left: 50%; transform: translateX(-50%);
+  z-index: 45; pointer-events: none;
+  background: #fff7e6; border-radius: 14px; padding: 14px 34px;
+  box-shadow: 0 10px 40px rgba(0,0,0,.45); text-align: center;
+  animation: cardin .5s ease-out;
+}
+#postcard h2 { margin: 0 0 4px; color: #4a6b2f; }
+#postcard p { margin: 2px 0; color: #5a4a35; font-size: 15px; }
+#postcard .pcScore { font-weight: 700; font-size: 18px; color: #a07a20; }
+@keyframes cardin { from { opacity: 0; transform: translateX(-50%) translateY(-16px); } to { opacity: 1; transform: translateX(-50%); } }
 
 #toasts {
   /* bottom of the play area — never on top of the toolbars */

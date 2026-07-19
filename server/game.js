@@ -1,113 +1,181 @@
-// Bloom & Burrow — authoritative simulation, prototype 3.
+// Bloom & Burrow — authoritative simulation, v7 "the growing cut".
 //
-// The core bet: both players sculpt living flows.
-//  - Bloom draws pheromone trails that evaporate unless ant traffic reinforces
-//    them (real stigmergy): a living road network that needs gardening.
-//  - Burrow digs tunnels that water actually flows through: rain pours in at
-//    the entrance, falls, pools and spreads. Architecture is survival.
+// Two interlocking growth engines (see PLAN.md §7):
+//  - Bloom builds a persistent TREE of trails over nodes (dock, wild sources,
+//    planted flowers). Segments are the scarce currency; nothing evaporates.
+//    Weather muddies, never erases. Planted flowers are both renewable food
+//    and the tree's custom junction nodes.
+//  - Burrow farms: fungus gardens (seed → 4 stages → harvest) and the brood
+//    (protein → queen → egg → tap-feed → ant), inside a nest whose climate is
+//    two visible lines — frost creeping from above, damp swelling from below.
+//    Comfort is the moving band between them; outside it things STALL, they
+//    don't die. The queen alone can die, slowly, against a visible meter.
+//  - The seed loop couples the halves both ways: gardens yield seeds, workers
+//    carry them out to the dock ledge, Bloom plants them where the network
+//    wants its next hub.
 
 'use strict';
 
-// The nest is DEEP, not wide — a vertical cut through the anthill. This is
-// portrait-shaped on purpose, and coarse on purpose: fewer, bigger cells so
-// every dig is a decision and every square is a fat touch target.
+// ---------- world ----------
 const GRID = { cols: 12, rows: 18 };
-const FROST_ROWS = 2;    // baseline frost; in winter it creeps deeper (see frostDepth)
-const MELT_ROW = 14;     // cells this deep seep groundwater in spring
-const QUEEN_SPEED = 0.8; // cells/s when carried to a new chamber
-const ENTRANCE = { c: 0, r: 0 };
 const WORLD = { w: 1000, h: 620 };
 const DOCK_POINT = { x: WORLD.w - 25, y: 310 };
 const DOCK_CAP = 15;
+const LEDGE_CAP = 3;              // outbound seed ledge — separate from the pile
+const ENTRANCE = { c: 0, r: 0 };
 
-const ANT_SPEED_OUT = 115;   // px/s in the meadow
-const ANT_SPEED_IN = 2.8;    // cells/s underground
-const HARVEST_TIME = 1.5, DIG_TIME = 1.2, HAUL_LOAD = 2;
-const EGG_COST = 4, EGG_TIME = 20, EGGS_PER_NURSERY = 3;
-const STORE_PER_CELL = 25;
-const EAT_PER_ANT = 0.013, EAT_QUEEN = 0.12, WINTER_EAT_MULT = 2.5;
-const FREEZE_LIMIT = 6;
-const MAX_SOURCES = 11;
+const ANT_SPEED_OUT = 115;        // px/s in the meadow
+const ANT_SPEED_IN = 2.8;         // cells/s underground
+const HARVEST_TIME = 1.5, DIG_TIME = 2.0, FILL_TIME = 3.0, HAUL_LOAD = 2;
+const QUEEN_SPEED = 0.8;
 
-// pheromone economy — tuned so a shared spine + short twigs beats straight
-// spokes: strokes are cheap, budget is scarce, traffic flows down the tree.
-const PHER_MAX = 100, PHER_REGEN = 1.8, PHER_COST_PER_PX = 0.1;
-const TRAIL_MAX = 12;
-const TRAIL_DECAY = 0.018;        // per second, untouched trail lives ~55s
-const TRAIL_REINFORCE = 0.07;     // per delivered good, applied to the WHOLE chain
-const TRAIL_RAIN_HIT = 0.35;      // instant loss when a rain event starts
-const TRAIL_PICKUP_R = 40;        // px: source counts as "on" a trail (generous — near misses count)
-const GATE_COST = 5;
+// ---------- economy ----------
+const STOCK_CAP = 10;             // pieces per stockpile cell, sugar+protein mixed
+const ANT_RATION = 100;           // s of colony time one sugar feeds one mouth
+const WINTER_EAT_MULT = 2.5;
+const FAMINE_DEATH = 25;          // s of empty stores between worker deaths (soft)
+const FREEZE_LIMIT = 8;           // s an ant survives outside in winter (they sprint home)
+const MAX_WILD = 11;
 
-// water
-const QUEEN_DROWN_TIME = 8;
-const ANT_DROWN_TIME = 5;
+// brood
+const EGG_TIME = 20, EGGS_PER_NURSERY = 3;
+const EGG_PROTEIN = 4;
+const EGG_FEED_GRACE = 7;
+const EGG_FEED_TIME = 8;
+
+// gardens — Burrow's crop: seed (1🍯+1🥩) → 4 stages → harvest 3🥩,
+// every 2nd harvest of a garden also yields a 🌰 seed
+const GARDEN_STAGES = 4, GARDEN_STAGE_TIME = 12;
+const GARDEN_YIELD = 3, GARDEN_SEED_EVERY = 2;
+
+// the trail tree — segments are the scarce currency (Mini Metro lines)
+const SEG_BASE = 8, SEG_PER_MILESTONE = 2;
+const SEG_PX = 150;               // 1 segment per 150 px of edge
+const EDGE_MAX_LEN = 600;         // forces trunks to hop through nodes
+const ERASE_REFUND_DELAY = 5;     // s before an erased edge's segments return
+const ORPHAN_TTL = 10;            // s an orphaned edge waits to be re-parented
+
+// planted flowers — renewable sugar AND the tree's custom waypoints
+const FLOWER_SPROUT = 20;
+const FLOWER_CAP = 6;
+const FLOWER_REGROW = 8;          // s per nectar piece, spring & summer
+const FLOWER_LIFE = 2;            // dies of old age after this many full years
+const PLANT_MIN_DOCK = 250;       // barren ring: nothing grows near the pit
+const PLANT_MIN_SPACING = 80;
+
+// progression — growth unlocks capacity for BOTH players, forever:
+// 10, 14, 18, 24, then every +8 ants (32, 40, 48…). Each milestone grants
+// trail segments and a garden slot — the colony that grows can build more.
+function milestoneThreshold(n) { return n < 4 ? [10, 14, 18, 24][n] : 24 + 8 * (n - 3); }
+const PREP_SPEED = 1.15;          // a warned colony works faster all season
+const NECTAR_SEED_EVERY = 25;     // foragers find a seed among this many petals
 
 const SEASONS = [
-  { name: 'Spring', len: 55, events: [{ t: 12, dur: 3, kind: 'rain', rate: 0.24 }] },
+  { name: 'Spring', len: 55, events: [{ t: 12, dur: 3, kind: 'rain' }] },
   { name: 'Summer', len: 55, events: [{ t: 18, dur: 8, kind: 'drought' }, { t: 38, dur: 8, kind: 'drought' }] },
-  { name: 'Autumn', len: 45, events: [{ t: 6, dur: 5, kind: 'rain', rate: 0.42 }, { t: 18, dur: 5, kind: 'rain', rate: 0.42 }, { t: 30, dur: 5, kind: 'rain', rate: 0.42 }] },
+  { name: 'Autumn', len: 45, events: [{ t: 6, dur: 5, kind: 'rain' }, { t: 18, dur: 5, kind: 'rain' }, { t: 30, dur: 5, kind: 'rain' }] },
   { name: 'Winter', len: 25, events: [] },
 ];
-// in winter the frost creeps downward: from row 2 at first snow to row ~7 at
-// the season's end — the queen must be carried below it, brood pauses above it
-function frostDepth(g) {
-  if (SEASONS[g.seasonIdx].name !== 'Winter') return FROST_ROWS;
-  return FROST_ROWS + (g.seasonT / SEASONS[3].len) * 5;
+
+// ---------- climate bands ----------
+// Two lines, both always visible, both moving slowly. Comfort is between
+// them. The peaks OVERLAP at row 7.5 on purpose: no row is safe all year,
+// so the nest needs a summer wing (shallow) and a winter wing (deep) and
+// everything breathes up and down the shaft once a year.
+function frostPeak(g) { return Math.min(9, 7.5 + 0.25 * (g.year - 1)); }
+function frostRow(g) {
+  let f = 2;
+  if (season(g).name === 'Winter') f = 2 + (frostPeak(g) - 2) * (g.seasonT / season(g).len);
+  if (g.drought) f = Math.max(f, 4);   // summer droughts bake the shallows
+  return f;
+}
+function dampRow(g) {
+  let d = 14;
+  if (season(g).name === 'Spring') d = 14 - (14 - 7.5) * Math.sin(Math.PI * g.seasonT / season(g).len);
+  return d - g.dampSurge;              // autumn rain pushes the damp up ~2 rows
+}
+function inComfort(g, r) { return r >= frostRow(g) && r < dampRow(g); }
+// how bad is this row right now? 0 = comfy, else rows beyond the line.
+// Damage scales with depth-beyond so a near-miss is a scar and sustained
+// neglect is fatal (a queen 5 rows into the frost loses ~8 HP/s).
+function bandStress(g, r) {
+  const f = frostRow(g), d = dampRow(g);
+  if (r < f) return f - r;
+  if (r >= d) return r - d + 1;
+  return 0;
+}
+// the queen never feels a surface drought (that's a farming concern — eggs
+// and gardens stall); only the winter frost and the rising damp touch her
+function queenBandStress(g) {
+  let f = 2;
+  if (season(g).name === 'Winter') f = 2 + (frostPeak(g) - 2) * (g.seasonT / season(g).len);
+  const d = dampRow(g), r = g.queenCell.r;
+  if (r < f) return f - r;
+  if (r >= d) return r - d + 1;
+  return 0;
 }
 
-let TOAST_SEQ = 1;
-let SOURCE_SEQ = 1;
-let TRAIL_SEQ = 1;
+let TOAST_SEQ = 1, SOURCE_SEQ = 1, EDGE_SEQ = 1, EGG_SEQ = 1, CARD_SEQ = 1;
 
 // ---------- construction ----------
 function createGame() {
   const g = {
     year: 1, seasonIdx: 0, seasonT: 0,
-    grid: [], water: [], ants: [], sources: [], eggs: [], digs: [], trails: [], toasts: [],
-    store: { sugar: 14, protein: 6 },
+    grid: [], ants: [], sources: [], edges: [], eggs: [], digs: [], toasts: [],
+    parent: { 0: null },              // trail tree: nodeId -> parent nodeId
+    refunds: [],                      // segments on their way back after an erase
     dock: { sugar: 0, protein: 0 },
+    ledge: 1,                         // outbound seeds — one starter gift for Bloom
+    seedStore: 0,                     // seeds waiting underground for the ferry
     desiredOutside: 4, recall: false,
-    pher: PHER_MAX,
-    queenHP: 100, starving: false, starveT: 0, queenDrownT: 0,
-    sourceTimer: 0, rebalanceT: 0, spreadFlip: false,
-    raining: false, rainRate: 0, drought: false,
-    lastCap: 0, capToastT: 0,
-    queen: { x: 4.5, y: 2.5, path: [] },   // the queen is movable — carry her with the seasons
+    queenHP: 100, starving: false,
+    eatAcc: 0, famineT: 0,
+    queenFed: 0, broodOn: true,
+    warnWinter: false, warnMelt: false, prepared: false, bandWarnT: 0,
+    raining: false, drought: false, mudT: 0, dampSurge: 0, proteinDiet: false,
+    sourceTimer: 0, rebalanceT: 0, nectarSeedAcc: 0,
+    milestone: 0,
+    queen: { x: 4.5, y: 2.5, path: [] },
     queenCell: { c: 4, r: 2 },
-    frostToasted: false,
+    stats: { gardenHarvests: 0, flowersPlanted: 0, cmds: { bloom: 0, burrow: 0 }, dangerT: 0, antsByYear: [] },
+    yearStats: { antsStart: 8, harvests: 0, planted: 0 },
+    postcard: null,
+    leakToastT: 0, stallToastT: 0, queenBandToastT: 0,
     gameOver: false, overMsg: '',
   };
   for (let r = 0; r < GRID.rows; r++) {
-    g.grid.push(Array.from({ length: GRID.cols }, () => ({ dug: false, kind: null, closed: false })));
-    g.water.push(new Array(GRID.cols).fill(0));
+    g.grid.push(Array.from({ length: GRID.cols }, () => ({
+      dug: false, kind: null,
+      sugar: 0, protein: 0,           // stockpile contents (mixed)
+      gs: 0, gt: 0, gh: 0, gp: 0,     // garden: stage, stage-progress, harvest count, pieces waiting
+      leakT: 0,
+    })));
   }
-  // starter nest: entrance corridor, a small drainage sump under it, queen deeper in
+  // starter nest: entrance corridor, a short shaft, the queen's quarters
   const predug = [
-    [0,0],[1,0],[2,0],[3,0],[4,0],       // entrance corridor
-    [1,1],[1,2],[1,3],                   // starter sump (catches rain water)
-    [4,1],[4,2],[3,2],[3,3],[5,2],[5,3], // living quarters
+    [0,0],[1,0],[2,0],[3,0],[4,0],    // entrance corridor
+    [4,1],[4,2],[4,3],                // shaft
+    [3,2],[3,3],[5,2],[5,3],          // living quarters
   ];
   for (const [c, r] of predug) g.grid[r][c].dug = true;
-  g.grid[2][5].kind = 'stockpile';
-  g.grid[3][5].kind = 'stockpile';
+  g.grid[2][5].kind = 'stockpile'; g.grid[2][5].sugar = 8;
+  g.grid[3][5].kind = 'stockpile'; g.grid[3][5].sugar = 2; g.grid[3][5].protein = 2;
   g.grid[3][3].kind = 'nursery';
-  g.lastCap = stockCap(g);
 
   for (let i = 0; i < 4; i++) g.ants.push(newAnt(g, 'out'));
   for (let i = 0; i < 4; i++) g.ants.push(newAnt(g, 'in'));
-  for (let i = 0; i < 6; i++) spawnSource(g);
-  toast(g, 'Year 1 — Spring. Draw trails from the dock to food!', false, 'bloom');
-  toast(g, 'Year 1 — Spring. Rain will pour in at the entrance — mind your sump.', false, 'burrow');
+  for (let i = 0; i < 6; i++) spawnWild(g);
+  toast(g, 'Year 1 — Spring. Tap the dock, then a source, to lay a trail. A seed waits on the ledge!', false, 'bloom');
+  toast(g, 'Year 1 — Spring. Dig, build a garden, keep the queen between the frost and the damp.', false, 'burrow');
   return g;
 }
 
 function newAnt(g, side) {
   const a = {
     side, state: side === 'out' ? 'idleOut' : 'idleIn',
-    x: 0, y: 0, path: [], carry: null, dig: null,
-    trailId: 0, s: 0, targetS: 0, dir: 1,
-    timer: 0, freeze: 0, drown: 0, wx: 0, wy: 0, wt: 0,
+    x: 0, y: 0, path: [], carry: null, dig: null, fetch: null,
+    route: null, ri: 0, timer: 0, freeze: 0, wx: 0, wy: 0, wt: 0,
+    px: 0, py: 0,                     // plant walk target (cosmetic)
   };
   if (side === 'out') {
     a.x = DOCK_POINT.x - 40 - Math.random() * 60;
@@ -121,42 +189,67 @@ function newAnt(g, side) {
 
 // ---------- helpers ----------
 function season(g) { return SEASONS[g.seasonIdx]; }
-function eventScale(g) { return 1 + 0.35 * (g.year - 1); }
 function cellOf(x, y) {
   return {
     c: Math.max(0, Math.min(GRID.cols - 1, Math.floor(x))),
     r: Math.max(0, Math.min(GRID.rows - 1, Math.floor(y))),
   };
 }
-function waterOpen(g, c, r) { // can water occupy/flow through this cell?
+function passable(g, c, r) {
   if (c < 0 || r < 0 || c >= GRID.cols || r >= GRID.rows) return false;
-  const cell = g.grid[r][c];
-  if (!cell.dug) return false;
-  if (cell.kind === 'gate' && cell.closed) return false;
-  return true;
+  return g.grid[r][c].dug;
 }
-function passable(g, c, r) { // can an ant walk here?
-  if (!waterOpen(g, c, r)) return false;
-  return g.water[r][c] <= 0.5;
+function storeTotals(g) {
+  const t = { sugar: 0, protein: 0 };
+  for (const row of g.grid) for (const cell of row) {
+    if (cell.kind === 'stockpile') { t.sugar += cell.sugar; t.protein += cell.protein; }
+  }
+  return t;
 }
-function stockCap(g) {
+function stockCaps(g) {
+  let n = 0;
+  for (const row of g.grid) for (const cell of row) if (cell.kind === 'stockpile') n += STOCK_CAP;
+  return n;
+}
+function storeTotal(g) { const t = storeTotals(g); return t.sugar + t.protein; }
+// free capacity in stockpiles that are NOT in the damp band (haulers avoid leaks)
+function stockSpace(g) {
+  const d = dampRow(g);
   let n = 0;
   for (let r = 0; r < GRID.rows; r++) for (let c = 0; c < GRID.cols; c++) {
     const cell = g.grid[r][c];
-    if (cell.kind === 'stockpile' && cell.dug && g.water[r][c] <= 0.5) n++;
+    if (cell.kind === 'stockpile' && r < d) n += STOCK_CAP - cell.sugar - cell.protein;
   }
-  return n * STORE_PER_CELL;
-}
-function storeTotal(g) { return g.store.sugar + g.store.protein; }
-function dockTotal(g) { return g.dock.sugar + g.dock.protein; }
-function gateCount(g) {
-  let n = 0;
-  for (const row of g.grid) for (const cell of row) if (cell.kind === 'gate') n++;
   return n;
 }
-function maxGates(g) { return 2 + (g.year - 1); }
+function payGood(g, good, n) {
+  const t = storeTotals(g);
+  if (t[good] < n) return false;
+  for (const row of g.grid) for (const cell of row) {
+    if (n > 0 && cell.kind === 'stockpile' && cell[good] > 0) {
+      const take = Math.min(n, cell[good]);
+      cell[good] -= take; n -= take;
+    }
+  }
+  return true;
+}
+function dockTotal(g) { return g.dock.sugar + g.dock.protein; }
+function gardenCount(g) {
+  let n = 0;
+  for (const row of g.grid) for (const cell of row) if (cell.kind === 'garden') n++;
+  return n;
+}
+function gardenCap(g) { return 1 + g.milestone; }
+function segCap(g) { return SEG_BASE + SEG_PER_MILESTONE * g.milestone; }
+function segUsed(g) {
+  let n = 0;
+  for (const e of g.edges) n += e.cost;
+  for (const r of g.refunds) n += r.amt;
+  return n;
+}
 function score(g) {
-  return (g.year - 1) * 20 + g.ants.length * 2 + Math.floor(storeTotal(g) / 5);
+  return g.ants.length * 2 + g.stats.gardenHarvests * 3 + g.stats.flowersPlanted * 4
+    + Math.floor(storeTotal(g) / 5);
 }
 function toast(g, msg, bad, role) {
   g.toasts.push({ id: TOAST_SEQ++, msg, bad: !!bad, role: role || 'all' });
@@ -164,7 +257,9 @@ function toast(g, msg, bad, role) {
 }
 function moveToward(a, tx, ty, speed, dt, snap) {
   const dx = tx - a.x, dy = ty - a.y, d = Math.hypot(dx, dy);
-  if (d < snap) { a.x = tx; a.y = ty; return true; }
+  // arrive when close enough OR when this step would overshoot — never
+  // oscillate around a waypoint, whatever the tick size
+  if (d < snap || speed * dt >= d) { a.x = tx; a.y = ty; return true; }
   a.x += (dx / d) * speed * dt;
   a.y += (dy / d) * speed * dt;
   return false;
@@ -192,121 +287,136 @@ function bfs(g, start, goalTest) {
   }
   return null;
 }
-function followPath(g, a, dt) {
+function followPath(g, a, dt, speed) {
   if (!a.path.length) return true;
   const t = a.path[0];
-  if (moveToward(a, t.c + 0.5, t.r + 0.5, ANT_SPEED_IN, dt, 0.08)) a.path.shift();
+  if (moveToward(a, t.c + 0.5, t.r + 0.5, speed, dt, 0.08)) a.path.shift();
   return a.path.length === 0;
 }
-function goIdleIn(a) { a.state = 'idleIn'; a.path = []; a.dig = null; }
-
-// ---------- trails ----------
-function polyLen(pts) {
-  let L = 0;
-  for (let i = 1; i < pts.length; i++) L += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
-  return L;
-}
-function buildTrail(pts) {
-  const cum = [0];
-  for (let i = 1; i < pts.length; i++) {
-    cum.push(cum[i - 1] + Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y));
-  }
-  return { pts, cum, len: cum[cum.length - 1] };
-}
-function trailPos(t, s) {
-  s = Math.max(0, Math.min(t.len, s));
-  let i = 1;
-  while (i < t.cum.length && t.cum[i] < s) i++;
-  if (i >= t.pts.length) return t.pts[t.pts.length - 1];
-  const a = t.pts[i - 1], b = t.pts[i];
-  const seg = t.cum[i] - t.cum[i - 1] || 1;
-  const f = (s - t.cum[i - 1]) / seg;
-  return { x: a.x + (b.x - a.x) * f, y: a.y + (b.y - a.y) * f };
-}
-function trailById(g, id) { return g.trails.find(t => t.id === id); }
-// a delivery strengthens the used stroke AND every ancestor down to the dock —
-// this is what makes trunk-and-twig networks beat straight spokes
-function reinforceChain(g, t, amount) {
-  let cur = t, guard = 0;
-  while (cur && guard++ < 30) {
-    cur.strength = Math.min(1, cur.strength + amount);
-    cur = cur.parentId ? trailById(g, cur.parentId) : null;
-  }
-}
-// s-positions where this trail passes near each source
-function computeTrailSources(g, t) {
-  t.srcS = [];
-  for (const src of g.sources) {
-    for (let i = 0; i < t.pts.length; i++) {
-      if (Math.hypot(t.pts[i].x - src.x, t.pts[i].y - src.y) <= TRAIL_PICKUP_R) {
-        t.srcS.push({ id: src.id, s: t.cum[i] });
-        break;
-      }
-    }
-  }
-  t.srcS.sort((a, b) => a.s - b.s);
-}
-function trailHasFood(g, t) {
-  return t.srcS.some(e => { const s = srcById(g, e.id); return s && s.amt > 0; });
-}
-function removeTrail(g, id) {
-  // removing a stroke takes its whole subtree with it — no path home, no trail
-  const doomed = new Set([id]);
-  let grew = true;
-  while (grew) {
-    grew = false;
-    for (const t of g.trails) {
-      if (!doomed.has(t.id) && doomed.has(t.parentId)) { doomed.add(t.id); grew = true; }
-    }
-  }
-  if (!g.trails.some(t => doomed.has(t.id))) return;
-  g.trails = g.trails.filter(t => !doomed.has(t.id));
-  for (const a of g.ants) {
-    if (a.side === 'out' && doomed.has(a.trailId) && (a.state === 'trailOut' || a.state === 'trailBack' || a.state === 'harvest')) {
-      a.trailId = 0;
-      a.state = 'freeBack';
-    }
-  }
+function goIdleIn(a) {
+  a.state = 'idleIn'; a.path = []; a.fetch = null;
+  if (a.dig) { a.dig.assigned = false; a.dig = null; }
 }
 
-// ---------- sources ----------
+// ---------- the trail tree ----------
 function srcById(g, id) { return g.sources.find(s => s.id === id); }
-function spawnSource(g) {
-  if (g.sources.filter(s => s.amt > 0).length >= MAX_SOURCES) return;
-  const minD = Math.min(120 + 70 * (g.year - 1), 550);
-  // sometimes seed the OPPOSITE food type near an existing source, so a single
-  // clever route through both lets ants fill both paws in one trip
-  const alive = g.sources.filter(s => s.amt > 0);
-  const anchor = alive.length && Math.random() < 0.45
-    ? alive[Math.floor(Math.random() * alive.length)] : null;
-  const type = anchor
-    ? (anchor.type === 'nectar' ? 'carcass' : 'nectar')
-    : (Math.random() < 0.66 ? 'nectar' : 'carcass');
-  for (let tries = 0; tries < 30; tries++) {
-    let x, y;
-    if (anchor) {
-      const ang = Math.random() * Math.PI * 2, dist = 95 + Math.random() * 120;
-      x = anchor.x + Math.cos(ang) * dist;
-      y = anchor.y + Math.sin(ang) * dist;
-      if (x < 40 || x > WORLD.w - 100 || y < 45 || y > WORLD.h - 45) continue;
-    } else {
-      x = 40 + Math.random() * (WORLD.w - 140);
-      y = 45 + Math.random() * (WORLD.h - 90);
+function nodePos(g, id) {
+  if (id === 0) return DOCK_POINT;
+  return srcById(g, id);
+}
+function edgeBetween(g, a, b) {
+  return g.edges.find(e => (e.a === a && e.b === b) || (e.a === b && e.b === a));
+}
+function edgesAt(g, id) { return g.edges.filter(e => e.a === id || e.b === id); }
+// recompute reachability from the dock. Edges that fall off the tree become
+// orphans: they gray out and auto-refund after ORPHAN_TTL unless a new edge
+// re-connects their component (re-parenting a whole subtree is one stroke).
+function recomputeTree(g) {
+  const parent = { 0: null };
+  const q = [0];
+  while (q.length) {
+    const cur = q.shift();
+    for (const e of g.edges) {
+      const other = e.a === cur ? e.b : (e.b === cur ? e.a : null);
+      if (other === null || other in parent) continue;
+      parent[other] = cur;
+      q.push(other);
     }
+  }
+  g.parent = parent;
+  for (const e of g.edges) {
+    const on = (e.a in parent) && (e.b in parent);
+    if (on) { e.orphan = false; e.orphanT = 0; }
+    else if (!e.orphan) { e.orphan = true; e.orphanT = ORPHAN_TTL; }
+  }
+}
+function pathFromDock(g, id) {
+  const path = [];
+  let cur = id, guard = 0;
+  while (cur !== null && cur !== undefined && guard++ < 200) {
+    path.unshift(cur);
+    cur = g.parent[cur];
+  }
+  return path[0] === 0 ? path : null;
+}
+function refundEdge(g, e, delay) {
+  g.refunds.push({ amt: e.cost, t: delay });
+}
+function removeEdge(g, id, delay) {
+  const i = g.edges.findIndex(e => e.id === id);
+  if (i < 0) return;
+  refundEdge(g, g.edges[i], delay);
+  g.edges.splice(i, 1);
+  recomputeTree(g);
+}
+
+// ---------- sources: wild feasts, husks, planted flowers ----------
+function srcGood(src) { return src.type === 'nectar' ? 'sugar' : 'protein'; }
+// a node is a "husk" when it can never offer food again but still stands as
+// a junction. Wild: depleted. Planted: dead of old age.
+function isHusk(src) {
+  if (src.sproutT > 0) return false;
+  if (src.planted) return src.dead;
+  return src.amt <= 0;
+}
+function spawnWild(g) {
+  const alive = g.sources.filter(s => !s.planted && s.amt > 0);
+  if (alive.length >= MAX_WILD) return;
+  // later years spawn farther out — reach, not punishment, is the difficulty
+  const minD = Math.min(120 + 40 * (g.year - 1), 550);
+  const type = Math.random() < 0.62 ? 'nectar' : 'carcass';
+  for (let tries = 0; tries < 30; tries++) {
+    const x = 40 + Math.random() * (WORLD.w - 140);
+    const y = 45 + Math.random() * (WORLD.h - 90);
     const d = Math.hypot(x - DOCK_POINT.x, y - DOCK_POINT.y);
-    if (d < minD * (anchor ? 0.7 : 1) || d > 980) continue;
-    if (g.sources.some(s => s.amt > 0 && Math.hypot(s.x - x, s.y - y) < 80)) continue;
-    // richness scales hard with distance: near the pit you find scraps that
-    // drain fast (trails there die and must be redrawn), far out sit feasts
-    // worth one long, permanent trail. Going high pays; staying low leaks
-    // pheromone on constant redrawing.
-    const src = {
-      id: SOURCE_SEQ++, x, y, type,
-      amt: (type === 'nectar' ? 3 : 2) + Math.min(14, Math.round(d / 75)),
-    };
-    g.sources.push(src);
-    for (const t of g.trails) computeTrailSources(g, t);
+    if (d < minD || d > 980) continue;
+    if (g.sources.some(s => Math.hypot(s.x - x, s.y - y) < 70)) continue;
+    let amt = (type === 'nectar' ? 3 : 2) + Math.min(14, Math.round(d / 75));
+    if (g.drought) amt = Math.round(amt * 1.25);   // drought concentrates the far nectar
+    g.sources.push({
+      id: SOURCE_SEQ++, x, y, type, amt,
+      planted: false, dead: false, sproutT: 0, regrowAcc: 0, fadeT: 0, birthYear: g.year,
+    });
     return;
+  }
+}
+// dormant = planted under the snow: the seed is a NODE immediately (you can
+// wire next spring's tree to it during the winter), and it sprouts at the thaw
+function plantFlower(g, x, y, dormant) {
+  const src = {
+    id: SOURCE_SEQ++, x, y, type: 'nectar', amt: 0,
+    planted: true, dead: false, dormant: !!dormant,
+    sproutT: dormant ? 0 : FLOWER_SPROUT, regrowAcc: 0, fadeT: 0, birthYear: g.year,
+  };
+  g.sources.push(src);
+  g.stats.flowersPlanted++;
+  g.yearStats.planted++;
+  // a nearby idle forager walks over to do the planting — pure charm
+  const ant = g.ants.find(a => a.side === 'out' && a.state === 'idleOut');
+  if (ant) { ant.state = 'plantGo'; ant.px = x; ant.py = y; }
+  return src;
+}
+function updateSources(g, dt) {
+  const sn = season(g).name;
+  for (const src of [...g.sources]) {
+    if (src.sproutT > 0) {
+      src.sproutT -= dt;
+      if (src.sproutT <= 0) src.amt = 2;   // the sprout opens with a little nectar
+      continue;
+    }
+    // planted flowers regrow through the warm seasons, sleep through the cold
+    if (src.planted && !src.dead && (sn === 'Spring' || sn === 'Summer') && !g.drought) {
+      src.regrowAcc += dt / FLOWER_REGROW;
+      while (src.regrowAcc >= 1 && src.amt < FLOWER_CAP) { src.regrowAcc -= 1; src.amt++; }
+    }
+    // depleted wild sources / dead flowers with no edges quietly fade away;
+    // with edges they stand as husks (junctions you're paying segments for)
+    if (isHusk(src)) {
+      if (edgesAt(g, src.id).length === 0) {
+        src.fadeT += dt;
+        if (src.fadeT > 10) g.sources.splice(g.sources.indexOf(src), 1);
+      } else src.fadeT = 0;
+    }
   }
 }
 
@@ -314,149 +424,83 @@ function spawnSource(g) {
 function applySeasonStart(g) {
   const name = season(g).name;
   if (name === 'Spring') {
+    // the year turns: postcard first, then the world wakes
+    const ys = g.yearStats;
+    g.postcard = {
+      id: CARD_SEQ++, year: g.year,
+      antsFrom: ys.antsStart, antsTo: g.ants.length,
+      harvests: ys.harvests, planted: ys.planted, score: score(g),
+    };
+    toast(g, `Year ${g.year} → ${g.year + 1}: ${ys.antsStart} → ${g.ants.length} ants · ${ys.harvests} harvests · ${ys.planted} flowers planted · ⭐ ${score(g)}`, false, 'all');
     g.year++;
-    toast(g, `Year ${g.year} — Spring! Score so far: ${score(g)}.`, false, 'all');
-    for (let i = 0; i < 4; i++) spawnSource(g);
-  } else if (name === 'Summer') {
-    toast(g, 'Summer — peak foraging, but droughts will bake your trails.', false, 'bloom');
-    toast(g, 'Summer — the nest dries out. Good time to dig.', false, 'burrow');
-  } else if (name === 'Autumn') {
-    toast(g, 'Autumn — heavy rain incoming. Warn your partner below!', true, 'bloom');
-    toast(g, 'Autumn — rain will pour in through the entrance. Dig sumps, set gates!', true, 'burrow');
+    g.stats.antsByYear.push(g.ants.length);
+    g.yearStats = { antsStart: g.ants.length, harvests: 0, planted: 0 };
+    g.prepared = g.warnMelt;
+    g.warnMelt = false;
+    // flowers age at the turn of the year; old ones wilt into husks.
+    // Winter-planted seeds wake with the thaw, right where Bloom planned them.
+    let woke = 0;
+    for (const src of g.sources) {
+      if (src.dormant) {
+        src.dormant = false; src.sproutT = FLOWER_SPROUT; src.birthYear = g.year;
+        woke++;
+        continue;
+      }
+      if (src.planted && !src.dead && g.year - src.birthYear >= FLOWER_LIFE) {
+        src.dead = true; src.amt = 0;
+      }
+    }
+    if (woke) toast(g, `${woke} winter seed${woke > 1 ? 's' : ''} sprout${woke > 1 ? '' : 's'} with the thaw 🌼`, false, 'bloom');
+    for (let i = 0; i < 4; i++) spawnWild(g);
   } else if (name === 'Winter') {
-    toast(g, 'Winter (fast forward) — the colony huddles and eats its stores.', true, 'all');
-    toast(g, 'The frost will creep downward — carry the queen below it!', true, 'burrow');
-    g.frostToasted = false;
-    g.sources.length = 0;
-    g.trails.length = 0;
-    for (const a of g.ants) {
-      if (a.side === 'out' && (a.state === 'trailOut' || a.state === 'trailBack' || a.state === 'harvest')) {
-        a.trailId = 0; a.state = 'freeBack';
-      }
-    }
+    g.prepared = g.warnWinter;
+    g.warnWinter = false;
     if (g.ants.some(a => a.side === 'out')) toast(g, 'Ants are still outside in the frost!', true, 'bloom');
-  }
-}
-
-function updateWeather(g, dt) {
-  const evs = season(g).events;
-  const wasRaining = g.raining;
-  g.raining = false; g.drought = false; g.rainRate = 0;
-  for (const ev of evs) {
-    if (g.seasonT >= ev.t && g.seasonT < ev.t + ev.dur) {
-      if (ev.kind === 'rain') { g.raining = true; g.rainRate = ev.rate * eventScale(g); }
-      else if (ev.kind === 'drought') g.drought = true;
-    }
-  }
-  if (g.raining && !wasRaining) {
-    for (const t of g.trails) t.strength -= TRAIL_RAIN_HIT;
-    toast(g, 'Rain! Your trails are washing out.', true, 'bloom');
-    toast(g, 'Rain! Water is coming in at the entrance.', true, 'burrow');
-  }
-}
-
-// ---------- water simulation ----------
-function updateWater(g, dt) {
-  const W = g.water;
-  // inflow: rain enters at the entrance and seeps through the topsoil
-  if (g.raining) {
-    if (waterOpen(g, ENTRANCE.c, ENTRANCE.r)) W[ENTRANCE.r][ENTRANCE.c] += g.rainRate * dt;
-    for (let c = 0; c < GRID.cols; c++) {
-      if (waterOpen(g, c, 0)) W[0][c] += 0.02 * dt;
-    }
-  }
-  // spring melt: groundwater seeps into anything dug too deep
-  if (season(g).name === 'Spring' && g.seasonT < 18) {
-    for (let r = MELT_ROW; r < GRID.rows; r++) {
-      for (let c = 0; c < GRID.cols; c++) {
-        if (waterOpen(g, c, r)) W[r][c] += 0.2 * eventScale(g) * dt;
-      }
-    }
-  }
-  // gravity: fall into the cell below
-  for (let r = GRID.rows - 2; r >= 0; r--) {
-    for (let c = 0; c < GRID.cols; c++) {
-      if (W[r][c] <= 0 || !waterOpen(g, c, r)) { if (!waterOpen(g, c, r)) W[r][c] = 0; continue; }
-      if (waterOpen(g, c, r + 1) && W[r + 1][c] < 1) {
-        const move = Math.min(W[r][c], 1 - W[r + 1][c]);
-        W[r][c] -= move; W[r + 1][c] += move;
-      }
-    }
-  }
-  // spread sideways (alternate direction to stay symmetric)
-  g.spreadFlip = !g.spreadFlip;
-  for (let r = 0; r < GRID.rows; r++) {
-    for (let ci = 0; ci < GRID.cols; ci++) {
-      const c = g.spreadFlip ? ci : GRID.cols - 1 - ci;
-      if (W[r][c] <= 0.03 || !waterOpen(g, c, r)) continue;
-      for (const dc of g.spreadFlip ? [1, -1] : [-1, 1]) {
-        const n = c + dc;
-        if (!waterOpen(g, n, r)) continue;
-        // only spread if the neighbour can't drain down and is lower
-        const diff = W[r][c] - W[r][n];
-        if (diff > 0.04) {
-          const move = diff / 2 * Math.min(1, 8 * dt);
-          W[r][c] -= move; W[r][n] += move;
-        }
-      }
-    }
-  }
-  // evaporation
-  const evap = (season(g).name === 'Summer' ? 0.06 : 0.008) * dt;
-  for (let r = 0; r < GRID.rows; r++) {
-    for (let c = 0; c < GRID.cols; c++) {
-      W[r][c] = Math.max(0, Math.min(1.2, W[r][c] - evap));
-    }
-  }
-
-  // -- consequences --
-  // drowned eggs
-  const before = g.eggs.length;
-  g.eggs = g.eggs.filter(e => W[e.r][e.c] <= 0.5);
-  if (g.eggs.length < before) toast(g, 'Eggs drowned in a flooded nursery!', true, 'burrow');
-  // flooded stockpiles spill their share
-  const cap = stockCap(g);
-  g.capToastT -= dt;
-  if (cap < g.lastCap && storeTotal(g) > cap) {
-    const total = storeTotal(g);
-    const keep = total > 0 ? cap / total : 0;
-    g.store.sugar = Math.floor(g.store.sugar * keep);
-    g.store.protein = Math.floor(g.store.protein * keep);
-    if (g.capToastT <= 0) { toast(g, 'A flooded stockpile spilled its supplies!', true, 'burrow'); g.capToastT = 6; }
-  }
-  g.lastCap = cap;
-  // the queen can drown
-  if (W[g.queenCell.r][g.queenCell.c] > 0.5) {
-    if (g.queenDrownT === 0) toast(g, '⚠ WATER IN THE THRONE ROOM — the queen is drowning!', true, 'all');
-    g.queenDrownT += dt;
-    if (g.queenDrownT >= QUEEN_DROWN_TIME) {
-      endGame(g, 'The queen drowned. Shape the nest so water flows away from her.');
-    }
   } else {
-    g.queenDrownT = 0;
+    g.prepared = false;
   }
-  // ants caught in deep water scramble or drown
-  for (const a of [...g.ants]) {
-    if (a.side !== 'in') continue;
-    const cell = cellOf(a.x, a.y);
-    if (W[cell.r][cell.c] > 0.7) {
-      let moved = false;
-      for (const [dc, dr] of [[0,-1],[1,0],[-1,0],[0,1]]) {
-        if (passable(g, cell.c + dc, cell.r + dr)) {
-          a.x = cell.c + dc + 0.5; a.y = cell.r + dr + 0.5;
-          goIdleIn(a); moved = true; break;
-        }
-      }
-      if (!moved) {
-        a.drown += dt;
-        if (a.drown > ANT_DROWN_TIME) {
-          g.ants.splice(g.ants.indexOf(a), 1);
-          toast(g, 'A worker drowned in the tunnels.', true, 'burrow');
-        }
-      }
-    } else {
-      a.drown = 0;
+}
+function updateWeather(g, dt) {
+  g.raining = false; g.drought = false;
+  for (const ev of season(g).events) {
+    if (g.seasonT >= ev.t && g.seasonT < ev.t + ev.dur) {
+      if (ev.kind === 'rain') g.raining = true;
+      else g.drought = true;
     }
+  }
+  // rain muddies the trails (half speed) and pushes the damp line up ~2 rows;
+  // both relax on their own — weather modulates, it never erases
+  if (g.raining) g.mudT = 5;
+  else g.mudT = Math.max(0, g.mudT - dt);
+  const surgeTarget = g.raining && season(g).name === 'Autumn' ? 2 : 0;
+  g.dampSurge += Math.sign(surgeTarget - g.dampSurge) * Math.min(Math.abs(surgeTarget - g.dampSurge), dt * 1.2);
+}
+
+// ---------- brood ----------
+function adjacentNursery(g) {
+  let best = null, bestN = EGGS_PER_NURSERY;
+  for (let dr = -1; dr <= 1; dr++) {
+    for (let dc = -1; dc <= 1; dc++) {
+      const c = g.queenCell.c + dc, r = g.queenCell.r + dr;
+      if (c < 0 || r < 0 || c >= GRID.cols || r >= GRID.rows) continue;
+      const cell = g.grid[r][c];
+      if (!cell.dug || cell.kind !== 'nursery') continue;
+      const n = g.eggs.filter(e => e.c === c && e.r === r).length;
+      if (n < bestN) { bestN = n; best = { c, r }; }
+    }
+  }
+  return best;
+}
+function queenWantsProtein(g) {
+  return g.broodOn && g.queenFed < EGG_PROTEIN && !g.queen.path.length && adjacentNursery(g) !== null;
+}
+function fetching(g, purpose) {
+  return g.ants.some(x => x.fetch && x.fetch.purpose === purpose);
+}
+function checkMilestone(g) {
+  while (g.ants.length >= milestoneThreshold(g.milestone)) {
+    g.milestone++;
+    toast(g, `🎉 The colony thrives — ${g.ants.length} ants! +${SEG_PER_MILESTONE} trail segments · garden slots: ${gardenCap(g)}`, false, 'all');
   }
 }
 
@@ -471,29 +515,32 @@ function tick(g, dt) {
     applySeasonStart(g);
   }
   const winter = season(g).name === 'Winter';
-  const name = season(g).name;
+  const sn = season(g).name;
 
   updateWeather(g, dt);
-  updateWater(g, dt);
+  updateSources(g, dt);
 
-  // pheromone budget & trail evaporation
-  g.pher = Math.min(PHER_MAX, g.pher + PHER_REGEN * dt);
-  const decay = TRAIL_DECAY * (g.drought ? 3 : 1) * dt;
-  for (const t of [...g.trails]) {
-    t.strength -= decay;
-    if (t.strength <= 0) {
-      removeTrail(g, t.id);
-      toast(g, 'A trail faded away — no ants were using it.', false, 'bloom');
+  // segments find their way back after erases
+  for (const r of [...g.refunds]) {
+    r.t -= dt;
+    if (r.t <= 0) g.refunds.splice(g.refunds.indexOf(r), 1);
+  }
+  // orphaned edges wait to be re-parented, then fade with a refund
+  for (const e of [...g.edges]) {
+    if (e.orphan) {
+      e.orphanT -= dt;
+      if (e.orphanT <= 0) removeEdge(g, e.id, 0);
     }
+    e.traffic = Math.max(0, (e.traffic || 0) - 0.05 * dt);
   }
 
-  if (name === 'Spring' || name === 'Summer') {
+  if (sn === 'Spring' || sn === 'Summer') {
     g.sourceTimer += dt;
-    if (g.sourceTimer > 6) { g.sourceTimer = 0; spawnSource(g); }
+    if (g.sourceTimer > 6) { g.sourceTimer = 0; spawnWild(g); }
   }
 
   g.rebalanceT += dt;
-  if (g.rebalanceT > 0.5) { g.rebalanceT = 0; rebalance(g); }
+  if (g.rebalanceT > 0.5) { g.rebalanceT = 0; rebalance(g, winter); }
 
   for (const a of [...g.ants]) updateAnt(g, a, dt, winter);
 
@@ -509,23 +556,49 @@ function tick(g, dt) {
     g.queenCell = cellOf(g.queen.x, g.queen.y);
   }
 
-  // winter frost creeps down: eggs above the line die, a shallow queen freezes
-  const fd = frostDepth(g);
-  if (winter) {
-    const before = g.eggs.length;
-    g.eggs = g.eggs.filter(e => e.r >= fd);
-    if (g.eggs.length < before) toast(g, 'Frost killed the eggs near the surface!', true, 'burrow');
-    if (g.queenCell.r < fd) {
-      if (!g.frostToasted) { g.frostToasted = true; toast(g, '⚠ THE QUEEN IS FREEZING — carry her below the frost line!', true, 'all'); }
-      g.queenHP -= 6 * dt;   // must out-pace the fed-queen regen (+3/s)
+  // ---- climate: everything outside comfort stalls; only the queen can die ----
+  const qStress = queenBandStress(g);
+  g.queenBandToastT -= dt;
+  g.bandWarnT -= dt;
+  // predictive warning: the line is CLOSING ON the queen but hasn't reached
+  // her — a heads-up you can act on, not a punishment you react to
+  if (qStress === 0 && g.bandWarnT <= 0) {
+    if (winter && g.queenCell.r - frostRow(g) < 1.8 && g.seasonT < season(g).len - 3) {
+      g.bandWarnT = 18;
+      toast(g, '⚠ The frost is creeping toward the queen — carry her deeper!', true, 'burrow');
+    } else if (sn === 'Spring' && g.seasonT < season(g).len * 0.5 && dampRow(g) - g.queenCell.r < 1.8) {
+      g.bandWarnT = 18;
+      toast(g, '⚠ The damp is rising toward the queen — carry her up!', true, 'burrow');
+    }
+  }
+  if (qStress > 0) {
+    g.queenHP -= (2 + 1.2 * (qStress - 1)) * dt;
+    if (g.queenBandToastT <= 0) {
+      g.queenBandToastT = 12;
+      const cold = g.queenCell.r < frostRow(g);
+      toast(g, cold ? '⚠ The queen shivers above the frost line — carry her down!' :
+        '⚠ The queen sits in the rising damp — carry her up!', true, 'all');
     }
   }
 
-  // eggs develop only in the queen's warmth, and faster near the warm surface
+  // when fed enough protein, she lays into an adjacent nursery
+  if (g.queenFed >= EGG_PROTEIN && !g.queen.path.length) {
+    const spot = adjacentNursery(g);
+    if (spot) {
+      g.queenFed -= EGG_PROTEIN;
+      g.eggs.push({ id: EGG_SEQ++, c: spot.c, r: spot.r, t: 0, fedT: EGG_FEED_GRACE, w: true });
+    }
+  }
+
+  // eggs develop in warmth + comfort + while fed; otherwise they stall (never die)
   for (const e of g.eggs) {
     const d = Math.hypot(e.c + 0.5 - g.queen.x, e.r + 0.5 - g.queen.y);
     e.w = d <= 3.5;
-    if (e.w) e.t += dt * (e.r <= 4 ? 1.4 : 1);
+    e.ok = inComfort(g, e.r);
+    if (e.w && e.ok && e.fedT > 0) {
+      e.t += dt * (e.r <= 5 ? 1.25 : 1);   // shallow nurseries hatch faster — summer wants you high
+      e.fedT -= dt;
+    }
   }
   g.eggs = g.eggs.filter(e => {
     if (g.grid[e.r][e.c].kind !== 'nursery' || !g.grid[e.r][e.c].dug) return false;
@@ -533,42 +606,88 @@ function tick(g, dt) {
       const ant = newAnt(g, 'in');
       ant.x = e.c + 0.5; ant.y = e.r + 0.5;
       g.ants.push(ant);
-      toast(g, 'An egg hatched — a new minor joins the colony!', false, 'all');
+      checkMilestone(g);
       return false;
     }
     return true;
   });
 
-  // eating
-  const need = (g.ants.length * EAT_PER_ANT + EAT_QUEEN) * dt * (winter ? WINTER_EAT_MULT : 1);
-  if (g.store.sugar >= need) {
-    g.store.sugar -= need;
-    g.starving = false;
-    g.queenHP = Math.min(100, g.queenHP + 3 * dt);
-  } else {
-    g.store.sugar = 0;
-    if (!g.starving) toast(g, 'Out of sugar — the colony is starving!', true, 'all');
-    g.starving = true;
-    g.queenHP -= 3.5 * dt;
-    g.starveT += dt;
-    if (g.starveT > 5 && g.ants.length > 0) {
-      g.starveT = 0;
-      g.ants.splice(Math.floor(Math.random() * g.ants.length), 1);
-      toast(g, 'A worker starved to death.', true, 'all');
+  // gardens grow only in comfort; stalls are shown, never punished
+  for (let r = 0; r < GRID.rows; r++) for (let c = 0; c < GRID.cols; c++) {
+    const cell = g.grid[r][c];
+    if (cell.kind !== 'garden' || cell.gs <= 0 || cell.gs >= GARDEN_STAGES) continue;
+    if (!inComfort(g, r)) continue;
+    cell.gt += dt;
+    if (cell.gt >= GARDEN_STAGE_TIME) { cell.gt = 0; cell.gs++; }
+  }
+
+  // stockpiles in the damp leak slowly — a drip, not a spill
+  g.leakToastT -= dt;
+  const dRow = dampRow(g);
+  for (let r = Math.max(0, Math.ceil(dRow)); r < GRID.rows; r++) {
+    for (let c = 0; c < GRID.cols; c++) {
+      const cell = g.grid[r][c];
+      if (cell.kind !== 'stockpile' || cell.sugar + cell.protein === 0) continue;
+      cell.leakT += dt;
+      if (cell.leakT >= 10) {
+        cell.leakT = 0;
+        if (cell.sugar >= cell.protein) cell.sugar--; else cell.protein--;
+        if (g.leakToastT <= 0) {
+          g.leakToastT = 15;
+          toast(g, 'A stockpile in the damp is leaking supplies — move them higher.', true, 'burrow');
+        }
+      }
     }
   }
 
-  if (g.queenHP <= 0) endGame(g, 'The queen starved. Keep sugar flowing across the dock next time.');
-  else if (g.ants.length === 0 && g.eggs.length === 0) endGame(g, 'The last worker is gone — the colony fell silent.');
+  // the colony eats from the stores by itself; dock scraps count in a pinch,
+  // and when the sugar runs dry it chews joylessly through protein at 2:1 —
+  // a glut of meat is dreary, never deadly
+  g.eatAcc += (g.ants.length + 1) * (winter ? WINTER_EAT_MULT : 1) * dt / ANT_RATION;
+  while (g.eatAcc >= 1) {
+    g.eatAcc -= 1;
+    if (payGood(g, 'sugar', 1)) { g.proteinDiet = false; }
+    else if (g.dock.sugar > 0) { g.dock.sugar--; g.proteinDiet = false; }
+    else if (payGood(g, 'protein', 2) || (g.dock.protein >= 2 && (g.dock.protein -= 2) >= 0)) {
+      if (!g.proteinDiet) {
+        g.proteinDiet = true;
+        toast(g, 'The sugar is gone — the colony grimly eats into the protein stores (2🥩 per meal).', true, 'all');
+      }
+    }
+  }
+  const t2 = storeTotals(g);
+  if (t2.sugar > 0 || g.dock.sugar > 0 || t2.protein >= 2 || g.dock.protein >= 2) {
+    g.starving = false; g.famineT = 0;
+    if (qStress === 0) g.queenHP = Math.min(100, g.queenHP + 3 * dt);
+  } else {
+    if (!g.starving) toast(g, 'The stores are EMPTY — the colony is starving!', true, 'all');
+    g.starving = true;
+    g.queenHP -= 3.5 * dt;
+    g.famineT += dt;
+    if (g.famineT >= FAMINE_DEATH && g.ants.length > 0) {
+      g.famineT = 0;
+      g.ants.splice(Math.floor(Math.random() * g.ants.length), 1);
+      toast(g, 'A worker starved to death.', true, 'burrow');
+    }
+  }
+
+  if (g.queenHP < 50) g.stats.dangerT += dt;
+  if (g.queenHP <= 0) {
+    endGame(g, g.starving ? 'The queen starved. Keep sugar flowing across the dock next time.'
+      : 'The queen faded outside the comfort band. Follow the lines — down in winter, up in spring.');
+  } else if (g.ants.length === 0 && g.eggs.length === 0) {
+    endGame(g, 'The last worker is gone — the colony fell silent.');
+  }
 }
 
-function rebalance(g) {
-  const eff = g.recall ? 0 : Math.min(g.desiredOutside, g.ants.length);
+function rebalance(g, winter) {
+  // winter recalls everyone; the world waits out the frost underground
+  const eff = (winter || g.recall) ? 0 : Math.min(g.desiredOutside, g.ants.length);
   const outCount = g.ants.filter(a => a.side === 'out' || a.state === 'goingOut').length;
   if (outCount > eff) {
     const a = g.ants.find(x => x.side === 'out' && (x.state === 'idleOut' || x.state === 'waitDock'))
-      || (g.recall ? g.ants.find(x => x.side === 'out') : null);
-    if (a) { a.state = 'goingIn'; a.trailId = 0; }
+      || ((winter || g.recall) ? g.ants.find(x => x.side === 'out') : null);
+    if (a) { a.state = 'goingIn'; a.route = null; }
   } else if (outCount < eff) {
     const a = g.ants.find(x => x.side === 'in' && x.state === 'idleIn');
     if (a) {
@@ -595,154 +714,156 @@ function updateAnt(g, a, dt, winter) {
   }
 }
 
-// ---- foraging with two typed paws: one sugar slot, one protein slot ----
-function srcGood(src) { return src.type === 'nectar' ? 'sugar' : 'protein'; }
+// ---- foraging along the tree, two typed paws ----
 function carryCount(a) { return a.carry ? a.carry.sugar + a.carry.protein : 0; }
 function slotFree(a, src) { return !a.carry || a.carry[srcGood(src)] === 0; }
-// next stop at/after position s where this ant can still pick something up
-function nextStop(g, t, s, a) {
-  for (const e of t.srcS) {
-    if (e.s < s - 1) continue;
-    const src = srcById(g, e.id);
-    if (src && src.amt > 0 && slotFree(a, src)) return e;
+function outSpeed(g) {
+  // in winter everyone outside is sprinting for the entrance — panic pace,
+  // so a reasonable recall loses nobody and only true stragglers freeze
+  const sprint = season(g).name === 'Winter' ? 1.45 : 1;
+  return ANT_SPEED_OUT * (g.mudT > 0 ? 0.5 : 1) * (g.prepared ? PREP_SPEED : 1) * sprint;
+}
+function harvestable(g, a, src) {
+  if (!src || src.amt <= 0 || src.sproutT > 0 || !slotFree(a, src)) return false;
+  // forager judgment: walk past food the dock is already drowning in —
+  // the visible signal that regulates the sugar/protein mix by itself
+  if (g.dock[srcGood(src)] >= 6) return false;
+  return true;
+}
+// pick a foraging target: any reachable node with food, weighted by amount
+function pickRoute(g, a) {
+  const opts = [];
+  for (const src of g.sources) {
+    if (src.amt <= 0 || src.sproutT > 0) continue;
+    if (!(src.id in g.parent)) continue;
+    if (g.dock[srcGood(src)] >= 6) continue;   // don't set out for a glutted good
+    opts.push(src);
   }
-  return null;
+  if (!opts.length) return null;
+  let total = 0;
+  for (const s of opts) total += s.amt;
+  let roll = Math.random() * total;
+  let pick = opts[0];
+  for (const s of opts) { roll -= s.amt; if (roll <= 0) { pick = s; break; } }
+  return pathFromDock(g, pick.id);
 }
-function takeFrom(g, a, src) {
-  src.amt--;
-  if (!a.carry) a.carry = { sugar: 0, protein: 0 };
-  a.carry[srcGood(src)]++;
-  if (src.amt <= 0) toast(g, `A ${src.type === 'nectar' ? 'flower' : 'carcass'} has been picked clean.`, false, 'bloom');
-}
-// unload at the dock while there is room; each good reinforces the whole chain
 function unloadAtDock(g, a) {
-  const t = trailById(g, a.trailId);
   while (a.carry && carryCount(a) > 0 && dockTotal(g) < DOCK_CAP) {
     const good = a.carry.sugar > 0 ? 'sugar' : 'protein';
     a.carry[good]--; g.dock[good]++;
-    if (t) reinforceChain(g, t, TRAIL_REINFORCE);
+    // now and then a forager finds a seed among the petals — a baseline
+    // trickle so the meadow farm never depends solely on Burrow's gardens
+    if (good === 'sugar' && ++g.nectarSeedAcc >= NECTAR_SEED_EVERY) {
+      g.nectarSeedAcc = 0;
+      if (g.ledge < LEDGE_CAP) {
+        g.ledge++;
+        toast(g, '🌰 A forager found a seed among the petals — it\'s on the ledge!', false, 'bloom');
+      }
+    }
+  }
+  // traffic glow: a delivery warms every edge on the route home (cosmetic)
+  if (a.route) {
+    for (let i = 1; i < a.route.length; i++) {
+      const e = edgeBetween(g, a.route[i - 1], a.route[i]);
+      if (e) e.traffic = Math.min(1.5, (e.traffic || 0) + 0.25);
+    }
   }
   if (a.carry && carryCount(a) === 0) a.carry = null;
-  return !a.carry; // true = fully unloaded
+  return !a.carry;
 }
 
 function updateOutsideAnt(g, a, dt) {
   switch (a.state) {
     case 'idleOut': {
       if (g.recall) { a.state = 'goingIn'; break; }
-      // choose a trail that leads to food, weighted by strength
-      const options = g.trails.filter(t => t.strength > 0.03 && nextStop(g, t, 0, a));
-      if (options.length) {
-        let total = 0;
-        for (const t of options) total += t.strength;
-        let roll = Math.random() * total;
-        let pick = options[0];
-        for (const t of options) { roll -= t.strength; if (roll <= 0) { pick = t; break; } }
-        a.trailId = pick.id; a.s = 0; a.targetS = nextStop(g, pick, 0, a).s;
-        a.dir = 1;
-        a.state = 'trailOut';
+      const route = pickRoute(g, a);
+      if (route && route.length > 1) {
+        a.route = route; a.ri = 1; a.state = 'routeOut';
         break;
       }
       wander(g, a, dt, DOCK_POINT.x - 60, DOCK_POINT.y, 70, false);
       break;
     }
-    case 'trailOut': {
-      const t = trailById(g, a.trailId);
-      if (!t) { a.trailId = 0; a.state = 'freeBack'; break; }
-      if (g.recall) { a.state = 'trailBack'; break; }
-      a.s += ANT_SPEED_OUT * dt;
-      const p = trailPos(t, a.s);
-      a.x = p.x; a.y = p.y;
-      if (a.s >= a.targetS) {
-        a.s = a.targetS;
-        const stop = t.srcS.find(e => Math.abs(e.s - a.targetS) < 1);
-        const src = stop && srcById(g, stop.id);
-        if (src && src.amt > 0 && slotFree(a, src)) {
-          a.state = 'harvest'; a.timer = HARVEST_TIME; a.dir = 1;
-        } else {
-          const next = carryCount(a) < 2 && nextStop(g, t, a.s + 1, a);
-          if (next) a.targetS = next.s;
-          else a.state = 'trailBack';
-        }
+    case 'routeOut': {
+      if (!a.route) { a.state = 'freeBack'; break; }
+      if (g.recall) { a.state = 'routeBack'; break; }
+      const node = nodePos(g, a.route[a.ri]);
+      if (!node) { a.route = null; a.state = 'freeBack'; break; }
+      if (moveToward(a, node.x, node.y, outSpeed(g), dt, 4)) {
+        const src = srcById(g, a.route[a.ri]);
+        if (harvestable(g, a, src)) { a.state = 'harvest'; a.timer = HARVEST_TIME; a.hdir = 1; break; }
+        if (a.ri >= a.route.length - 1 || carryCount(a) >= 2) a.state = 'routeBack';
+        else a.ri++;
       }
       break;
     }
     case 'harvest': {
-      const t = trailById(g, a.trailId);
-      if (!t) { a.state = 'freeBack'; break; }
-      const stop = t.srcS.find(e => Math.abs(e.s - a.s) < 1.5);
-      const src = stop && srcById(g, stop.id);
+      const src = srcById(g, a.route ? a.route[a.ri] : -1);
       if (!src || src.amt <= 0 || !slotFree(a, src)) {
-        a.state = a.dir === 1 ? 'trailOut' : 'trailBack';
-        if (a.dir === 1) {
-          const next = carryCount(a) < 2 && nextStop(g, t, a.s + 1, a);
-          if (next) a.targetS = next.s; else a.state = 'trailBack';
-        }
+        a.state = a.hdir === 1 ? 'routeOut' : 'routeBack';
+        if (a.hdir === 1 && a.route && (a.ri >= a.route.length - 1 || carryCount(a) >= 2)) a.state = 'routeBack';
+        else if (a.hdir === 1 && a.route) a.ri++;
         break;
       }
       a.timer -= dt;
       if (a.timer <= 0) {
-        takeFrom(g, a, src);
-        if (a.dir === 1) {
-          // paws free and more food further out? keep walking the route
-          const next = carryCount(a) < 2 && !g.recall && nextStop(g, t, a.s + 1, a);
-          if (next) { a.targetS = next.s; a.state = 'trailOut'; }
-          else a.state = 'trailBack';
+        src.amt--;
+        if (!a.carry) a.carry = { sugar: 0, protein: 0 };
+        a.carry[srcGood(src)]++;
+        if (a.hdir === 1 && a.route && a.ri < a.route.length - 1 && carryCount(a) < 2 && !g.recall) {
+          a.ri++; a.state = 'routeOut';
         } else {
-          a.state = 'trailBack';
+          a.state = 'routeBack';
         }
       }
       break;
     }
-    case 'trailBack': {
-      const t = trailById(g, a.trailId);
-      if (!t) { a.state = 'freeBack'; break; }
-      const prevS = a.s;
-      a.s -= ANT_SPEED_OUT * dt;
-      // grab food we pass on the way home if a paw is free
-      if (carryCount(a) < 2 && !g.recall) {
-        for (const e of t.srcS) {
-          if (e.s <= prevS && e.s >= a.s) {
-            const src = srcById(g, e.id);
-            if (src && src.amt > 0 && slotFree(a, src)) {
-              a.s = e.s; a.state = 'harvest'; a.timer = HARVEST_TIME; a.dir = -1;
-              break;
-            }
-          }
-        }
+    case 'routeBack': {
+      if (!a.route) { a.state = 'freeBack'; break; }
+      if (a.ri <= 0) {
+        if (unloadAtDock(g, a)) { a.route = null; a.state = g.recall ? 'goingIn' : 'idleOut'; }
+        else a.state = 'waitDock';
+        break;
       }
-      const p = trailPos(t, Math.max(0, a.s));
-      a.x = p.x; a.y = p.y;
-      if (a.state === 'trailBack' && a.s <= 0) {
-        if (unloadAtDock(g, a)) {
-          a.trailId = 0;
-          a.state = g.recall ? 'goingIn' : 'idleOut';
-        } else a.state = 'waitDock';
+      const node = nodePos(g, a.route[a.ri]);
+      if (!node) { a.route = null; a.state = 'freeBack'; break; }
+      if (moveToward(a, node.x, node.y, outSpeed(g), dt, 4)) {
+        // pick up what we pass on the way home if a paw is free
+        const src = srcById(g, a.route[a.ri]);
+        if (carryCount(a) < 2 && !g.recall && harvestable(g, a, src)) {
+          a.state = 'harvest'; a.timer = HARVEST_TIME; a.hdir = -1;
+          break;
+        }
+        a.ri--;
       }
       break;
     }
     case 'freeBack': {
-      if (moveToward(a, DOCK_POINT.x, DOCK_POINT.y, ANT_SPEED_OUT, dt, 4)) {
-        if (unloadAtDock(g, a)) {
-          a.trailId = 0;
-          a.state = g.recall ? 'goingIn' : 'idleOut';
-        } else a.state = 'waitDock';
+      if (moveToward(a, DOCK_POINT.x, DOCK_POINT.y, outSpeed(g), dt, 4)) {
+        if (unloadAtDock(g, a)) { a.route = null; a.state = g.recall ? 'goingIn' : 'idleOut'; }
+        else a.state = 'waitDock';
       }
       break;
     }
     case 'waitDock': {
       if (dockTotal(g) < DOCK_CAP) {
-        if (unloadAtDock(g, a)) {
-          a.trailId = 0;
-          a.state = g.recall ? 'goingIn' : 'idleOut';
-        }
+        if (unloadAtDock(g, a)) { a.route = null; a.state = g.recall ? 'goingIn' : 'idleOut'; }
       } else if (g.recall) { a.state = 'goingIn'; }
       else wander(g, a, dt, DOCK_POINT.x - 30, DOCK_POINT.y, 30, false);
       break;
     }
+    case 'plantGo': {
+      // walking out to pat the seed into the earth (the sprout grows either way)
+      if (moveToward(a, a.px, a.py, outSpeed(g), dt, 5)) a.state = 'idleOut';
+      break;
+    }
     case 'goingIn': {
-      if (moveToward(a, DOCK_POINT.x, DOCK_POINT.y, ANT_SPEED_OUT, dt, 4)) {
-        if (a.carry) { g.dock.sugar += a.carry.sugar; g.dock.protein += a.carry.protein; a.carry = null; }
+      if (moveToward(a, DOCK_POINT.x, DOCK_POINT.y, outSpeed(g), dt, 4)) {
+        while (a.carry && carryCount(a) > 0 && dockTotal(g) < DOCK_CAP) {
+          const good = a.carry.sugar > 0 ? 'sugar' : 'protein';
+          a.carry[good]--; g.dock[good]++;
+        }
+        a.carry = null; a.route = null;
         a.side = 'in';
         a.x = ENTRANCE.c + 0.5; a.y = ENTRANCE.r + 0.5;
         goIdleIn(a);
@@ -753,80 +874,213 @@ function updateOutsideAnt(g, a, dt) {
   }
 }
 
+// ---- inside labor: dig, feed the queen, haul, ferry seeds, clear gardens ----
+function inSpeed(g) { return ANT_SPEED_IN * (g.prepared ? PREP_SPEED : 1); }
+function pathToProtein(g, a) {
+  return bfs(g, cellOf(a.x, a.y), (c, r) => {
+    const cell = g.grid[r][c];
+    return cell.kind === 'stockpile' && cell.protein > 0;
+  });
+}
+function pathToStockSpace(g, a) {
+  const d = dampRow(g);
+  return bfs(g, cellOf(a.x, a.y), (c, r) => {
+    const cell = g.grid[r][c];
+    return cell.kind === 'stockpile' && cell.sugar + cell.protein < STOCK_CAP && r < d;
+  });
+}
+function returnGoods(g, a) {
+  if (a.carry) {
+    for (const good of ['sugar', 'protein']) {
+      let n = a.carry[good];
+      for (const row of g.grid) for (const cell of row) {
+        if (n > 0 && cell.kind === 'stockpile' && cell.sugar + cell.protein < STOCK_CAP) {
+          cell[good]++; n--;
+        }
+      }
+    }
+  }
+  a.carry = null;
+}
+function deliverPath(g, a) {
+  return bfs(g, cellOf(a.x, a.y), (c, r) => c === g.queenCell.c && r === g.queenCell.r);
+}
+
 function updateInsideAnt(g, a, dt) {
   switch (a.state) {
     case 'idleIn': {
+      // 1. construction
       let tookDig = false;
       for (const d of g.digs) {
         if (d.assigned) continue;
-        const path = bfs(g, cellOf(a.x, a.y), (c, r) =>
-          Math.abs(c - d.c) + Math.abs(r - d.r) === 1);
+        const path = bfs(g, cellOf(a.x, a.y), (c, r) => Math.abs(c - d.c) + Math.abs(r - d.r) === 1);
         if (path !== null) { d.assigned = true; a.dig = d; a.path = path; a.state = 'digGo'; tookDig = true; break; }
       }
       if (tookDig) break;
-      const space = stockCap(g) - storeTotal(g);
-      if (dockTotal(g) > 0 && space > 0) {
+      // 2. protein for the queen — how eggs get made
+      if (queenWantsProtein(g) && !fetching(g, 'queenProtein')) {
+        const path = pathToProtein(g, a);
+        if (path !== null) { a.fetch = { purpose: 'queenProtein' }; a.path = path; a.state = 'fetchGo'; break; }
+      }
+      // 3. carry a seed out to the ledge — Bloom is waiting for it
+      if (g.seedStore > 0 && g.ledge < LEDGE_CAP && !fetching(g, 'seedOut')) {
+        const path = bfs(g, cellOf(a.x, a.y), (c, r) => c === ENTRANCE.c && r === ENTRANCE.r);
+        if (path !== null) { a.fetch = { purpose: 'seedOut' }; a.path = path; a.state = 'seedGo'; break; }
+      }
+      // 4. haul dock goods into the stores
+      if (dockTotal(g) > 0 && stockSpace(g) > 0) {
         const haulers = g.ants.filter(x => x.state === 'haulGo').length;
         if (haulers * HAUL_LOAD < dockTotal(g)) {
           const path = bfs(g, cellOf(a.x, a.y), (c, r) => c === ENTRANCE.c && r === ENTRANCE.r);
           if (path !== null) { a.path = path; a.state = 'haulGo'; break; }
         }
       }
+      // 5. clear harvested garden pieces into the stores
+      if (stockSpace(g) > 0 && !fetching(g, 'gardenClear')) {
+        const path = bfs(g, cellOf(a.x, a.y), (c, r) => g.grid[r][c].kind === 'garden' && g.grid[r][c].gp > 0);
+        if (path !== null) { a.fetch = { purpose: 'gardenClear' }; a.path = path; a.state = 'gardenGo'; break; }
+      }
       wander(g, a, dt, g.queenCell.c + 0.5, g.queenCell.r + 0.5, 1.6, true);
       break;
     }
     case 'goingOut': {
-      if (followPath(g, a, dt)) {
+      if (followPath(g, a, dt, inSpeed(g))) {
         a.side = 'out';
         a.x = DOCK_POINT.x; a.y = DOCK_POINT.y;
         a.state = 'idleOut';
       }
       break;
     }
+    case 'fetchGo': {
+      if (!a.fetch) { goIdleIn(a); break; }
+      if (followPath(g, a, dt, inSpeed(g))) {
+        const at = cellOf(a.x, a.y);
+        const cell = g.grid[at.r][at.c];
+        if (cell.kind !== 'stockpile' || cell.protein <= 0) { goIdleIn(a); break; }
+        cell.protein--;
+        a.carry = { sugar: 0, protein: 1 };
+        const path = deliverPath(g, a);
+        if (path === null) { returnGoods(g, a); goIdleIn(a); break; }
+        a.path = path;
+        a.state = 'deliverGo';
+      }
+      break;
+    }
+    case 'deliverGo': {
+      if (!a.fetch) { returnGoods(g, a); goIdleIn(a); break; }
+      if (followPath(g, a, dt, inSpeed(g))) {
+        const at = cellOf(a.x, a.y);
+        if (Math.max(Math.abs(at.c - g.queenCell.c), Math.abs(at.r - g.queenCell.r)) <= 1) {
+          g.queenFed++;
+          a.carry = null;
+        } else {
+          const p = deliverPath(g, a);
+          if (p !== null) { a.path = p; break; }
+          returnGoods(g, a);
+        }
+        goIdleIn(a);
+      }
+      break;
+    }
+    case 'seedGo': {
+      if (followPath(g, a, dt, inSpeed(g))) {
+        if (g.seedStore > 0 && g.ledge < LEDGE_CAP) {
+          g.seedStore--; g.ledge++;
+          toast(g, '🌰 A seed arrived on the dock ledge — plant it!', false, 'bloom');
+        }
+        goIdleIn(a);
+      }
+      break;
+    }
     case 'digGo': {
       if (!a.dig || !g.digs.includes(a.dig)) { goIdleIn(a); break; }
-      if (followPath(g, a, dt)) { a.state = 'digging'; a.timer = DIG_TIME; }
+      if (followPath(g, a, dt, inSpeed(g))) {
+        a.state = 'digging';
+        a.timer = a.dig.fill ? FILL_TIME : DIG_TIME;
+      }
       break;
     }
     case 'digging': {
       if (!a.dig || !g.digs.includes(a.dig)) { goIdleIn(a); break; }
       a.timer -= dt;
       if (a.timer <= 0) {
-        g.grid[a.dig.r][a.dig.c].dug = true;
+        const { c, r, fill } = a.dig;
+        if (fill) {
+          const occupied = (g.queenCell.c === c && g.queenCell.r === r)
+            || g.eggs.some(e => e.c === c && e.r === r);
+          if (occupied) {
+            toast(g, 'Can\'t backfill that chamber — someone is still in it.', true, 'burrow');
+          } else {
+            const cell = g.grid[r][c];
+            cell.dug = false; cell.kind = null;
+            cell.sugar = 0; cell.protein = 0; cell.gs = 0; cell.gt = 0; cell.gp = 0;
+            for (const o of g.ants) {
+              if (o === a || o.side !== 'in') continue;
+              const oc = cellOf(o.x, o.y);
+              if (oc.c === c && oc.r === r) { o.x = a.x; o.y = a.y; goIdleIn(o); }
+            }
+          }
+        } else {
+          g.grid[r][c].dug = true;
+        }
         g.digs.splice(g.digs.indexOf(a.dig), 1);
         goIdleIn(a);
       }
       break;
     }
     case 'haulGo': {
-      if (followPath(g, a, dt)) {
-        const cap = stockCap(g);
-        const space = cap - storeTotal(g);
-        // a sensible quartermaster: never let protein hog the pantry — sugar is
-        // life. Excess protein stays on the dock (a visible signal to Bloom).
-        const proteinOk = () => g.store.protein + (a.carry ? a.carry.protein : 0) < cap * 0.6;
-        let take = Math.min(HAUL_LOAD, dockTotal(g), Math.max(0, space));
-        if (take <= 0) { goIdleIn(a); break; }
+      if (followPath(g, a, dt, inSpeed(g))) {
+        // prefer whichever good the stores are shorter on — protein must
+        // never crowd the sugar out of the pantry
+        const t = storeTotals(g);
+        let good = null;
+        if (g.dock.sugar > 0 && g.dock.protein > 0) good = t.sugar <= t.protein ? 'sugar' : 'protein';
+        else if (g.dock.sugar > 0) good = 'sugar';
+        else if (g.dock.protein > 0) good = 'protein';
+        if (!good || stockSpace(g) <= 0) { goIdleIn(a); break; }
+        const take = Math.min(HAUL_LOAD, g.dock[good], stockSpace(g));
+        g.dock[good] -= take;
         a.carry = { sugar: 0, protein: 0 };
-        for (let i = 0; i < take; i++) {
-          if (g.dock.sugar > 0) { g.dock.sugar--; a.carry.sugar++; }
-          else if (g.dock.protein > 0 && proteinOk()) { g.dock.protein--; a.carry.protein++; }
-        }
-        if (a.carry.sugar + a.carry.protein === 0) { a.carry = null; goIdleIn(a); break; }
-        const path = bfs(g, cellOf(a.x, a.y), (c, r) =>
-          g.grid[r][c].kind === 'stockpile' && g.water[r][c] <= 0.5);
+        a.carry[good] = take;
+        const path = pathToStockSpace(g, a);
         if (path === null) {
-          g.dock.sugar += a.carry.sugar; g.dock.protein += a.carry.protein;
+          g.dock[good] += take;
           a.carry = null; goIdleIn(a); break;
         }
         a.path = path; a.state = 'haulReturn';
       }
       break;
     }
+    case 'gardenGo': {
+      if (followPath(g, a, dt, inSpeed(g))) {
+        const at = cellOf(a.x, a.y);
+        const cell = g.grid[at.r][at.c];
+        if (cell.kind !== 'garden' || cell.gp <= 0) { goIdleIn(a); break; }
+        const take = Math.min(HAUL_LOAD, cell.gp);
+        cell.gp -= take;
+        a.carry = { sugar: 0, protein: take };
+        const path = pathToStockSpace(g, a);
+        if (path === null) { cell.gp += take; a.carry = null; goIdleIn(a); break; }
+        a.path = path; a.state = 'haulReturn'; a.fetch = null;
+      }
+      break;
+    }
     case 'haulReturn': {
-      if (followPath(g, a, dt)) {
-        g.store.sugar += a.carry.sugar;
-        g.store.protein += a.carry.protein;
+      if (followPath(g, a, dt, inSpeed(g))) {
+        const at = cellOf(a.x, a.y);
+        const cell = g.grid[at.r][at.c];
+        if (a.carry && cell.kind === 'stockpile') {
+          for (const good of ['sugar', 'protein']) {
+            const put = Math.min(a.carry[good], STOCK_CAP - cell.sugar - cell.protein);
+            cell[good] += put;
+            a.carry[good] -= put;
+          }
+        }
+        if (a.carry && carryCount(a) > 0) {
+          const path = pathToStockSpace(g, a);
+          if (path !== null) { a.path = path; break; }
+          g.dock.sugar += a.carry.sugar; g.dock.protein += a.carry.protein;   // back to the dock pile
+        }
         a.carry = null;
         goIdleIn(a);
       }
@@ -855,54 +1109,66 @@ function wander(g, a, dt, cx, cy, radius, inside) {
 
 function endGame(g, msg) {
   g.gameOver = true;
-  g.overMsg = msg + ` — Final score: ${score(g)} (Year ${g.year}).`;
+  g.overMsg = msg + ` — Colony Bloom: ⭐ ${score(g)} (Year ${g.year}).`;
 }
 
 // ---------- commands ----------
 function command(g, role, cmd) {
   if (g.gameOver) return;
+  if (g.stats && g.stats.cmds[role] !== undefined) g.stats.cmds[role]++;
   if (role === 'bloom') {
-    if (cmd.type === 'trail') {
-      if (g.trails.length >= TRAIL_MAX) { toast(g, `Max ${TRAIL_MAX} trails — erase one first (right-click).`, true, 'bloom'); return; }
-      let raw = Array.isArray(cmd.pts) ? cmd.pts : [];
-      raw = raw.slice(0, 150)
-        .map(p => ({ x: +p[0], y: +p[1] }))
-        .filter(p => isFinite(p.x) && isFinite(p.y) && p.x >= 0 && p.x <= WORLD.w && p.y >= 0 && p.y <= WORLD.h);
-      if (raw.length < 2) return;
-      let fullPts, newLen, parentId = 0, ownStart = 1;
-      const parent = cmd.attachId ? trailById(g, cmd.attachId) : null;
-      if (parent) {
-        const idx = Math.max(0, Math.min(parent.pts.length - 1, cmd.attachIdx | 0));
-        fullPts = parent.pts.slice(0, idx + 1).concat(raw);
-        newLen = polyLen([parent.pts[idx], ...raw]);
-        parentId = parent.id;
-        ownStart = idx + 1;
-      } else {
-        if (Math.hypot(raw[0].x - DOCK_POINT.x, raw[0].y - DOCK_POINT.y) > 60) {
-          toast(g, 'Trails must start at the dock (or branch off an existing trail).', true, 'bloom');
-          return;
-        }
-        fullPts = [{ x: DOCK_POINT.x, y: DOCK_POINT.y }, ...raw];
-        newLen = polyLen(fullPts);
+    if (cmd.type === 'edge') {
+      const A = cmd.a | 0, B = cmd.b | 0;
+      const pa = nodePos(g, A), pb = nodePos(g, B);
+      if (!pa || !pb || A === B) return;
+      if (edgeBetween(g, A, B)) { toast(g, 'Those two are already linked.', true, 'bloom'); return; }
+      const aIn = A in g.parent, bIn = B in g.parent;
+      if (aIn && bIn) { toast(g, 'Both ends are already on the network.', true, 'bloom'); return; }
+      if (!aIn && !bIn) { toast(g, 'Start from the network — every trail leads home.', true, 'bloom'); return; }
+      const len = Math.hypot(pa.x - pb.x, pa.y - pb.y);
+      if (len < 20) return;
+      if (len > EDGE_MAX_LEN) { toast(g, 'Too far for one trail — hop through a node partway.', true, 'bloom'); return; }
+      const cost = Math.ceil(len / SEG_PX);
+      if (segUsed(g) + cost > segCap(g)) {
+        toast(g, `Not enough trail segments (${cost} needed, ${segCap(g) - segUsed(g)} free) — erase somewhere, or grow the colony.`, true, 'bloom');
+        return;
       }
-      if (newLen < 20) return;
-      if (newLen > 1400) { toast(g, 'That trail is too long for one stroke.', true, 'bloom'); return; }
-      const cost = newLen * PHER_COST_PER_PX;
-      if (cost > g.pher) { toast(g, `Not enough pheromone (${Math.ceil(cost)} needed).`, true, 'bloom'); return; }
-      g.pher -= cost;
-      const t = { id: TRAIL_SEQ++, parentId, ownStart, ...buildTrail(fullPts), strength: 1, srcS: [] };
-      computeTrailSources(g, t);
-      g.trails.push(t);
+      g.edges.push({ id: EDGE_SEQ++, a: A, b: B, len: Math.round(len), cost, orphan: false, orphanT: 0, traffic: 0 });
+      recomputeTree(g);
     } else if (cmd.type === 'erase') {
-      removeTrail(g, cmd.id);
+      // winter is planning season: refunds are instant under the snow
+      removeEdge(g, cmd.id | 0, season(g).name === 'Winter' ? 0 : ERASE_REFUND_DELAY);
+    } else if (cmd.type === 'plant') {
+      if (g.ledge <= 0) { toast(g, 'No seed on the ledge — Burrow\'s gardens make them.', true, 'bloom'); return; }
+      const x = +cmd.x, y = +cmd.y;
+      if (!isFinite(x) || !isFinite(y) || x < 40 || x > WORLD.w - 60 || y < 45 || y > WORLD.h - 45) return;
+      if (Math.hypot(x - DOCK_POINT.x, y - DOCK_POINT.y) < PLANT_MIN_DOCK) {
+        toast(g, 'Nothing grows on the trampled earth near the pit — plant farther out.', true, 'bloom');
+        return;
+      }
+      const near = g.sources.some(s => Math.hypot(s.x - x, s.y - y) < PLANT_MIN_SPACING);
+      if (near) { toast(g, 'Too close to another plant — give the roots room.', true, 'bloom'); return; }
+      g.ledge--;
+      // winter planting tucks the seed under the snow: a node you can wire
+      // trails to RIGHT NOW — plan next spring's whole tree while it sleeps
+      plantFlower(g, x, y, season(g).name === 'Winter');
     } else if (cmd.type === 'recall') {
       g.recall = !g.recall;
-      toast(g, g.recall ? 'RECALL — all foragers are coming home.' : 'Recall lifted — foragers head back out.', false, 'all');
+    } else if (cmd.type === 'warn') {
+      const sn = season(g).name;
+      const left = Math.ceil(season(g).len - g.seasonT);
+      if (sn === 'Autumn' && !g.warnWinter) {
+        g.warnWinter = true;
+        toast(g, `⚠ 🌸 Bloom warns: WINTER in ~${left}s — hoard sugar, carry the queen down! (a warned colony works faster)`, true, 'burrow');
+      } else if (sn === 'Winter' && !g.warnMelt) {
+        g.warnMelt = true;
+        toast(g, `⚠ 🌸 Bloom warns: the THAW in ~${left}s — the damp will rise, plan the queen's climb!`, true, 'burrow');
+      }
     }
   } else if (role === 'burrow') {
     const c = cmd.c | 0, r = cmd.r | 0;
     const valid = c >= 0 && r >= 0 && c < GRID.cols && r < GRID.rows;
-    if (!valid && cmd.type !== 'alloc') return;
+    if (!valid && cmd.type !== 'alloc' && cmd.type !== 'brood') return;
     const cell = valid ? g.grid[r][c] : null;
     if (cmd.type === 'dig') {
       const existing = g.digs.findIndex(d => d.c === c && d.r === r);
@@ -911,39 +1177,78 @@ function command(g, role, cmd) {
         const nextToTunnel = [[1,0],[-1,0],[0,1],[0,-1]].some(([dc, dr]) => {
           const cc = c + dc, rr = r + dr;
           return cc >= 0 && rr >= 0 && cc < GRID.cols && rr < GRID.rows && g.grid[rr][cc].dug;
-        }) || g.digs.some(d => Math.abs(d.c - c) + Math.abs(d.r - r) === 1);
-        if (nextToTunnel) g.digs.push({ c, r, assigned: false });
+        }) || g.digs.some(d => !d.fill && Math.abs(d.c - c) + Math.abs(d.r - r) === 1);
+        if (nextToTunnel) g.digs.push({ c, r, assigned: false, fill: false });
         else toast(g, 'Dig next to an existing tunnel.', true, 'burrow');
       }
-    } else if (cmd.type === 'build') {
-      if (cmd.kind === 'gate') {
-        if (!cell.dug || cell.kind) return;
-        if (gateCount(g) >= maxGates(g)) { toast(g, `Max ${maxGates(g)} gates this year.`, true, 'burrow'); return; }
-        if (g.store.sugar < GATE_COST) { toast(g, `A gate costs ${GATE_COST} sugar.`, true, 'burrow'); return; }
-        g.store.sugar -= GATE_COST;
-        cell.kind = 'gate'; cell.closed = true;
-        toast(g, 'Gate built (closed). Click it to open/close.', false, 'burrow');
-      } else if ((cmd.kind === 'stockpile' || cmd.kind === 'nursery') && cell.dug && !cell.kind && g.water[r][c] <= 0.5) {
-        cell.kind = cmd.kind;
+    } else if (cmd.type === 'fill') {
+      const existing = g.digs.findIndex(d => d.c === c && d.r === r);
+      if (existing >= 0) { g.digs.splice(existing, 1); return; }
+      if (!cell.dug) return;
+      if (c === ENTRANCE.c && r === ENTRANCE.r) { toast(g, 'The entrance can\'t be filled.', true, 'burrow'); return; }
+      if (cell.kind) {
+        if (g.eggs.some(e => e.c === c && e.r === r)) { toast(g, 'The brood is still in there!', true, 'burrow'); return; }
+        if (cell.sugar + cell.protein + cell.gp > 0) toast(g, 'The stored goods were lost with the room.', true, 'burrow');
+        cell.kind = null; cell.sugar = 0; cell.protein = 0; cell.gs = 0; cell.gt = 0; cell.gh = 0; cell.gp = 0;
+      } else {
+        if (g.queenCell.c === c && g.queenCell.r === r) { toast(g, 'The queen is in there!', true, 'burrow'); return; }
+        g.digs.push({ c, r, assigned: false, fill: true });
       }
-    } else if (cmd.type === 'gate') {
-      if (cell.kind === 'gate') cell.closed = !cell.closed;
-    } else if (cmd.type === 'egg') {
-      if (cell.kind !== 'nursery' || !cell.dug || g.water[r][c] > 0.5) toast(g, 'Lay eggs in a (dry) nursery.', true, 'burrow');
-      else if (g.eggs.filter(x => x.c === c && x.r === r).length >= EGGS_PER_NURSERY) toast(g, 'That nursery is full.', true, 'burrow');
-      else if (g.store.protein < EGG_COST) toast(g, `Need ${EGG_COST} protein for an egg.`, true, 'burrow');
-      else { g.store.protein -= EGG_COST; g.eggs.push({ c, r, t: 0 }); }
+    } else if (cmd.type === 'build') {
+      if (!cell.dug || cell.kind) return;
+      if (cmd.kind === 'stockpile') {
+        cell.kind = 'stockpile';
+      } else if (cmd.kind === 'nursery') {
+        cell.kind = 'nursery';
+      } else if (cmd.kind === 'garden') {
+        if (gardenCount(g) >= gardenCap(g)) {
+          toast(g, `Garden slots: ${gardenCap(g)} — the colony must grow before it farms more.`, true, 'burrow');
+          return;
+        }
+        cell.kind = 'garden'; cell.gs = 0; cell.gt = 0; cell.gh = 0; cell.gp = 0;
+      }
+    } else if (cmd.type === 'seedGarden') {
+      if (cell.kind !== 'garden' || cell.gs !== 0 || cell.gp > 0) return;
+      const t = storeTotals(g);
+      if (t.sugar < 1 || t.protein < 1) {
+        toast(g, 'Seeding a garden takes 1🍯 + 1🥩 compost from the stores.', true, 'burrow');
+        return;
+      }
+      payGood(g, 'sugar', 1); payGood(g, 'protein', 1);
+      cell.gs = 1; cell.gt = 0;
+    } else if (cmd.type === 'harvest') {
+      if (cell.kind !== 'garden' || cell.gs < GARDEN_STAGES) return;
+      cell.gs = 0; cell.gt = 0; cell.gh++;
+      cell.gp += GARDEN_YIELD;
+      g.stats.gardenHarvests++;
+      g.yearStats.harvests++;
+      if (cell.gh % GARDEN_SEED_EVERY === 0) {
+        if (g.seedStore + g.ledge < LEDGE_CAP) {
+          g.seedStore++;
+        } else {
+          cell.gp++;   // seeds are precious but not infinite — extra becomes food
+        }
+      }
+    } else if (cmd.type === 'feed') {
+      if (cell.kind !== 'nursery') return;
+      for (const e of g.eggs) {
+        if (e.c !== c || e.r !== r || e.fedT > 0) continue;
+        if (!payGood(g, 'sugar', 1)) {
+          toast(g, 'No sugar in the stores to feed the brood!', true, 'burrow');
+          break;
+        }
+        e.fedT = EGG_FEED_TIME;
+      }
     } else if (cmd.type === 'moveQueen' && valid) {
-      if (!cell.dug || g.water[r][c] > 0.5) {
-        toast(g, 'The queen needs a dry, dug chamber.', true, 'burrow');
+      if (!cell.dug) {
+        toast(g, 'The queen needs a dug chamber.', true, 'burrow');
       } else {
         const path = bfs(g, g.queenCell, (cc, rr) => cc === c && rr === r);
         if (path === null) toast(g, 'No open path for the queen.', true, 'burrow');
-        else if (path.length) {
-          g.queen.path = path;
-          toast(g, 'The queen is on the move — keep her path dry!', false, 'burrow');
-        }
+        else if (path.length) g.queen.path = path;
       }
+    } else if (cmd.type === 'brood') {
+      g.broodOn = !g.broodOn;
     } else if (cmd.type === 'alloc') {
       g.desiredOutside = Math.max(0, Math.min(60, cmd.n | 0));
     }
@@ -951,54 +1256,80 @@ function command(g, role, cmd) {
 }
 
 // ---------- serialization ----------
-const KIND_CHAR = { stockpile: 'S', nursery: 'N' };
 function publicState(g) {
   const gridRows = g.grid.map(row => row.map(cell => {
     if (!cell.dug) return '#';
-    if (cell.kind === 'gate') return cell.closed ? 'D' : 'O';
-    return cell.kind ? KIND_CHAR[cell.kind] : '.';
+    if (cell.kind === 'stockpile') return 'S';
+    if (cell.kind === 'nursery') return 'N';
+    if (cell.kind === 'garden') return 'G';
+    return '.';
   }).join(''));
-  const waterRows = g.water.map(row =>
-    row.map(w => Math.max(0, Math.min(9, Math.round(w * 9)))).join(''));
+  const stocks = [];
+  const gardens = [];
+  for (let r = 0; r < GRID.rows; r++) for (let c = 0; c < GRID.cols; c++) {
+    const cell = g.grid[r][c];
+    if (cell.kind === 'stockpile' && cell.sugar + cell.protein > 0) {
+      stocks.push({ c, r, s: cell.sugar, p: cell.protein });
+    }
+    if (cell.kind === 'garden') {
+      gardens.push({ c, r, st: cell.gs, t: Math.round(cell.gt), pc: cell.gp, ok: inComfort(g, r) ? 1 : 0 });
+    }
+  }
+  const totals = storeTotals(g);
   return {
-    world: WORLD, gridDim: GRID, frostRows: FROST_ROWS, meltRow: MELT_ROW,
-    dockCap: DOCK_CAP, eggCost: EGG_COST,
+    world: WORLD, gridDim: GRID,
+    dockCap: DOCK_CAP, ledgeCap: LEDGE_CAP, stockCellCap: STOCK_CAP, eggProtein: EGG_PROTEIN,
+    gardenStages: GARDEN_STAGES,
+    plantMinDock: PLANT_MIN_DOCK,
     seasons: SEASONS.map(s => ({ name: s.name, len: s.len, events: s.events })),
     year: g.year, seasonIdx: g.seasonIdx, seasonT: Math.round(g.seasonT * 10) / 10,
     seasonLen: season(g).len,
-    raining: g.raining, drought: g.drought,
-    pher: Math.round(g.pher), pherMax: PHER_MAX, trailMax: TRAIL_MAX,
-    gates: { count: gateCount(g), max: maxGates(g), cost: GATE_COST },
+    raining: g.raining, drought: g.drought, mud: g.mudT > 0,
+    seg: { used: segUsed(g), cap: segCap(g) },
+    milestone: g.milestone,
+    nextMilestone: milestoneThreshold(g.milestone),
+    gardenCap: gardenCap(g), gardenCount: gardenCount(g),
     score: score(g),
-    store: { sugar: Math.floor(g.store.sugar), protein: Math.floor(g.store.protein) },
-    cap: stockCap(g),
+    store: totals, caps: { total: stockCaps(g) },
+    stocks, gardens,
+    seeds: { store: g.seedStore, ledge: g.ledge },
     dock: g.dock, desiredOutside: g.desiredOutside, recall: g.recall,
-    queenHP: Math.round(g.queenHP), starving: g.starving,
-    queenDanger: g.queenDrownT > 0, queenCell: g.queenCell,
+    queenHP: Math.round(g.queenHP), starving: g.starving, proteinDiet: g.proteinDiet,
+    queenStress: queenBandStress(g) > 0,
+    queenCell: g.queenCell,
     queen: { x: Math.round(g.queen.x * 100) / 100, y: Math.round(g.queen.y * 100) / 100, moving: g.queen.path.length > 0 },
-    frostDepth: Math.round(frostDepth(g) * 10) / 10,
+    queenFed: g.queenFed, broodOn: g.broodOn,
+    warn: { winterGiven: g.warnWinter, meltGiven: g.warnMelt },
+    prepared: g.prepared,
+    frostRow: Math.round(frostRow(g) * 10) / 10,
+    dampRow: Math.round(dampRow(g) * 10) / 10,
     ants: g.ants.map(a => ({
       s: a.side === 'out' ? 1 : 0,
       x: Math.round(a.x * 100) / 100, y: Math.round(a.y * 100) / 100,
-      // bitmask: 1 = carrying sugar, 2 = carrying protein (both = 3)
       c: a.carry ? ((a.carry.sugar > 0 ? 1 : 0) | (a.carry.protein > 0 ? 2 : 0)) : 0,
     })),
-    sources: g.sources.filter(s => s.amt > 0).map(s => ({
+    sources: g.sources.map(s => ({
       id: s.id, x: Math.round(s.x), y: Math.round(s.y), type: s.type, amt: s.amt,
+      pl: s.planted ? 1 : 0, husk: isHusk(s) ? 1 : 0, sprout: s.sproutT > 0 ? Math.ceil(s.sproutT) : 0,
+      dm: s.dormant ? 1 : 0,
     })),
-    trails: g.trails.map(t => ({
-      id: t.id,
-      ownStart: t.ownStart,
-      strength: Math.round(t.strength * 100) / 100,
-      pts: t.pts.map(p => [Math.round(p.x), Math.round(p.y)]),
-      food: trailHasFood(g, t),
+    edges: g.edges.map(e => ({
+      id: e.id, a: e.a, b: e.b, cost: e.cost,
+      orphan: e.orphan ? 1 : 0, traffic: Math.round((e.traffic || 0) * 100) / 100,
     })),
-    grid: gridRows, water: waterRows,
-    digs: g.digs.map(d => ({ c: d.c, r: d.r })),
-    eggs: g.eggs.map(e => ({ c: e.c, r: e.r, t: Math.round(e.t), w: e.w ? 1 : 0 })),
+    grid: gridRows,
+    digs: g.digs.map(d => ({ c: d.c, r: d.r, f: d.fill ? 1 : 0 })),
+    eggs: g.eggs.map(e => ({
+      c: e.c, r: e.r, t: Math.round(e.t), w: e.w ? 1 : 0,
+      f: e.fedT > 0 ? 1 : 0, ok: e.ok === false ? 0 : 1,
+    })),
+    postcard: g.postcard,
     toasts: g.toasts,
     gameOver: g.gameOver, overMsg: g.overMsg,
   };
 }
 
-module.exports = { createGame, tick, command, publicState, SEASONS };
+module.exports = {
+  createGame, tick, command, publicState, SEASONS, storeTotals, stockCaps,
+  frostRow, dampRow, inComfort, GRID, score,
+};

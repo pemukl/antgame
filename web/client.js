@@ -1,5 +1,7 @@
-// Bloom & Burrow client, prototype 3.
-// Bloom: drag to paint pheromone trails. Burrow: dig against flowing water.
+// Bloom & Burrow client, v7 "the growing cut".
+// Bloom: tap node → tap node (or drag) to lay permanent trail edges; plant
+// seeds into flowers that double as junctions. Burrow: farm gardens and keep
+// the colony inside the comfort band between the frost and the damp lines.
 
 'use strict';
 
@@ -37,9 +39,10 @@ const snd = {
   rain: () => beep(220, 0.5, 'triangle', 0.05),
   draw: () => beep(520, 0.05, 'sine', 0.03),
   gate: () => beep(330, 0.1, 'square', 0.04),
+  harvest: () => { beep(440, 0.08, 'sine', 0.06); setTimeout(() => beep(550, 0.1, 'sine', 0.06), 80); },
+  milestone: () => { beep(523, 0.12, 'sine', 0.08); setTimeout(() => beep(659, 0.12, 'sine', 0.08), 120); setTimeout(() => beep(784, 0.2, 'sine', 0.08), 240); },
 };
 $('muteBtn').onclick = () => { muted = !muted; $('muteBtn').textContent = muted ? '🔇' : '🔊'; };
-// mobile browsers keep audio suspended until a user gesture
 document.addEventListener('pointerdown', () => {
   try { if (ac().state === 'suspended') audio.resume(); } catch (e) { /* no audio */ }
 }, { passive: true });
@@ -63,7 +66,6 @@ async function join(role) {
   $('roleInfo').textContent = myRole === 'bloom' ? 'You are 🌸 BLOOM' : 'You are ⛏️ BURROW';
   $('shareUrl').textContent = location.href;
   layoutCanvas();
-  // bars fill with content over the next frames — refit once they settle
   setTimeout(layoutCanvas, 300);
   setTimeout(layoutCanvas, 1200);
 }
@@ -74,8 +76,6 @@ function cmd(obj) {
 $('joinBloom').onclick = () => join('bloom');
 $('joinBurrow').onclick = () => join('burrow');
 $('botBtn').onclick = () => cmd({ type: 'bot' });
-// ?role=bloom auto-joins; add &bot=1 to also summon a bot partner — handy for
-// solo dev-testing (e.g. /?role=burrow&bot=1)
 {
   const params = new URLSearchParams(location.search);
   const want = params.get('role');
@@ -85,12 +85,21 @@ $('botBtn').onclick = () => cmd({ type: 'bot' });
 }
 $('restartBtn').onclick = () => cmd({ type: 'restart' });
 $('recallBtn').onclick = () => cmd({ type: 'recall' });
-let eraseMode = false;
-$('eraseBtn').onclick = () => {
-  eraseMode = !eraseMode;
+$('warnBtn').onclick = () => { cmd({ type: 'warn' }); snd.gate(); };
+$('broodBtn').onclick = () => cmd({ type: 'brood' });
+
+// Bloom's two modes on top of normal connect: erase and plant
+let eraseMode = false, plantMode = false;
+function setModes(e, p) {
+  eraseMode = e; plantMode = p;
+  selNode = null; pending = null;
   $('eraseBtn').classList.toggle('on', eraseMode);
   $('eraseBtn').textContent = eraseMode ? '✕ Erasing — tap a trail' : '✕ Erase';
-};
+  $('plantBtn').classList.toggle('on', plantMode);
+}
+$('eraseBtn').onclick = () => setModes(!eraseMode, false);
+$('plantBtn').onclick = () => setModes(false, !plantMode);
+
 for (const b of document.querySelectorAll('.tool')) {
   b.onclick = () => {
     tool = b.dataset.tool;
@@ -107,7 +116,7 @@ async function pollLobby() {
   try {
     const s = await (await fetch('/state')).json();
     for (const role of ['bloom', 'burrow']) {
-      const status = s.roles[role];   // 'free' | 'bot' | 'human'
+      const status = s.roles[role];
       const label = $(role + 'Taken');
       label.classList.toggle('hidden', status === 'free');
       label.textContent = status === 'bot' ? '🤖 bot playing — join to take over' : 'taken';
@@ -120,6 +129,7 @@ pollLobby();
 
 // ---------- state-driven UI ----------
 let lastAnts = -1, lastDockTotal = -1, lastRaining = false, lastDeliverBeep = 0;
+let lastMilestone = -1, lastCard = -1, lastSeasonIdx = -1;
 function onState() {
   const s = curr;
   const showWaiting = s.paused && !s.gameOver;
@@ -131,7 +141,7 @@ function onState() {
 
   const seasonName = s.seasons[s.seasonIdx].name;
   const pill = $('seasonPill');
-  pill.textContent = `${seasonName} · Year ${s.year}`;
+  pill.textContent = `${seasonName} · Year ${s.year}` + (s.prepared ? ' ⚡' : '');
   const cols = { Spring: '#8fbf6b', Summer: '#e8c95a', Autumn: '#d98e4a', Winter: '#a9c4d8' };
   pill.style.background = cols[seasonName];
   $('seasonFill').style.width = (100 * s.seasonT / s.seasonLen) + '%';
@@ -140,13 +150,12 @@ function onState() {
   const botPartner = s.roles && s.roles[myRole === 'bloom' ? 'burrow' : 'bloom'] === 'bot';
   const dockT = s.dock.sugar + s.dock.protein;
   if (window.innerWidth < 560) {
-    // compact HUD: every pixel of a phone screen belongs to the world
-    $('antInfo').textContent = `🐜${s.ants.length} · ${out} out` +
+    $('antInfo').textContent = `🐜${s.ants.length}→${s.nextMilestone} · ${out} out` +
       (s.recall ? ' · ⛑' : '') + (botPartner ? ' · 🤖' : '');
     $('dockInfo').textContent = `⚓${dockT}/${s.dockCap}` + (dockT >= s.dockCap ? '⚠' : '');
   } else {
-    $('antInfo').textContent = `🐜 ${s.ants.length} — ${out} out / ${s.ants.length - out} in` +
-      (s.recall ? ' · RECALL' : ` · target ${s.desiredOutside}`) + (botPartner ? ' · partner 🤖' : '');
+    $('antInfo').textContent = `🐜 ${s.ants.length} — next milestone at ${s.nextMilestone}` +
+      ` · ${out} out` + (s.recall ? ' · RECALL' : '') + (botPartner ? ' · partner 🤖' : '');
     $('dockInfo').textContent = `Dock ${dockT}/${s.dockCap}` + (dockT >= s.dockCap ? ' ⚠ JAM' : '');
   }
   $('scoreInfo').textContent = `⭐ ${s.score}`;
@@ -154,41 +163,109 @@ function onState() {
   if (myRole === 'bloom') {
     $('recallBtn').textContent = s.recall ? 'Recall ON — lift it' : 'Recall foragers';
     $('recallBtn').classList.toggle('on', s.recall);
+    const wb = $('warnBtn');
+    if (seasonName === 'Autumn') {
+      wb.classList.remove('hidden');
+      wb.disabled = s.warn.winterGiven;
+      wb.textContent = s.warn.winterGiven ? '✓ warned' : '📢 Warn: winter!';
+    } else if (seasonName === 'Winter') {
+      wb.classList.remove('hidden');
+      wb.disabled = s.warn.meltGiven;
+      wb.textContent = s.warn.meltGiven ? '✓ warned' : '📢 Warn: the melt!';
+    } else {
+      wb.classList.add('hidden');
+    }
     $('forecast').textContent = forecast(s, seasonName);
-    $('pherFill').style.width = (100 * s.pher / s.pherMax) + '%';
-    $('pherVal').textContent = s.pher;
-    // delivery blip when goods land on the dock
+    const free = s.seg.cap - s.seg.used;
+    $('segInfo').innerHTML = `〰 <b>${free}</b> free of ${s.seg.cap}`;
+    $('plantBtn').textContent = `🌰 Plant (${s.seeds.ledge})` + (seasonName === 'Winter' ? ' — under the snow' : '');
+    $('plantBtn').disabled = s.seeds.ledge <= 0;
+    if (s.seeds.ledge <= 0 && plantMode) setModes(false, false);
     if (lastDockTotal >= 0 && dockT > lastDockTotal && performance.now() - lastDeliverBeep > 150) {
       snd.deliver(); lastDeliverBeep = performance.now();
     }
   } else {
     $('storeInfo').innerHTML =
-      `🍯 <b>${s.store.sugar}</b> · 🥩 <b>${s.store.protein}</b> · storage ${s.store.sugar + s.store.protein}/${s.cap}`;
+      `🍯 <b>${s.store.sugar}</b> · 🥩 <b>${s.store.protein}</b> / ${s.caps.total}` +
+      ` · 🌰 ${s.seeds.store + s.seeds.ledge}` + (s.proteinDiet ? ' <b style="color:#a05030">protein diet</b>' : '');
     $('queenInfo').innerHTML = `👑 ${s.queenHP}%` +
-      (s.queenDanger ? ' <b style="color:#a02020">DROWNING!</b>' : '') +
+      (s.queenStress ? ' <b style="color:#a02020">STRESSED</b>' : '') +
       (s.starving ? ' <b style="color:#a02020">STARVING</b>' : '') +
-      ` · 🥚 ${s.eggs.length} · 🚪 ${s.gates.count}/${s.gates.max}`;
+      ` · 🥚 ${s.eggs.length} · egg 🥩${s.queenFed}/${s.eggProtein} · 🍄 ${s.gardenCount}/${s.gardenCap}`;
+    $('broodBtn').textContent = s.broodOn ? '🍼 Brood: ON' : '🍼 Brood: OFF';
+    $('broodBtn').classList.toggle('warn', !s.broodOn);
+    const wi = $('warnInfo');
+    if (seasonName === 'Autumn' && s.warn.winterGiven) {
+      wi.textContent = `⚠ ❄ winter in ${Math.ceil(s.seasonLen - s.seasonT)}s`;
+    } else if (seasonName === 'Winter' && s.warn.meltGiven) {
+      wi.textContent = `⚠ 💧 melt in ${Math.ceil(s.seasonLen - s.seasonT)}s`;
+    } else {
+      wi.textContent = '';
+    }
     const slider = $('allocSlider');
     slider.max = Math.max(1, s.ants.length);
     if (document.activeElement !== slider) {
       slider.value = s.desiredOutside;
       $('allocVal').textContent = s.desiredOutside;
     }
+    // first-game nudge: the garden is the heart of Burrow's loop
+    const gbtn = document.querySelector('[data-tool="garden"]');
+    if (gbtn) gbtn.classList.toggle('pulse', s.gardenCount === 0 && s.year === 1);
   }
 
-  if (lastAnts >= 0 && s.ants.length > lastAnts) snd.hatch();
+  if (lastAnts >= 0 && s.ants.length > lastAnts && !s.paused) {
+    snd.hatch();
+    // a birth is worth a little party
+    if (myRole === 'burrow') {
+      const geo = burrowGeom(s);
+      const qx = geo.ox + s.queen.x * geo.cell, qy = geo.oy + s.queen.y * geo.cell;
+      puff(qx, qy, '#e8a0bf', 14);
+      floatText(qx, qy - 14, '+1 🐜');
+    } else {
+      const dq = P(975, 310);
+      floatText(dq.x, dq.y - 40, '+1 🐜');
+    }
+  }
   if (s.raining && !lastRaining) snd.rain();
+  if (lastMilestone >= 0 && s.milestone > lastMilestone) {
+    snd.milestone();
+    confetti();
+    showBanner(`🎉 ${s.ants.length} ants — the colony thrives!`);
+  }
+  // the turning of the year, softly announced (a milestone banner wins)
+  if (lastSeasonIdx >= 0 && s.seasonIdx !== lastSeasonIdx && !s.paused && (!banner || banner.life < 1.2)) {
+    const em = { Spring: '🌱', Summer: '☀️', Autumn: '🍂', Winter: '❄️' }[seasonName];
+    showBanner(`${em} ${seasonName}` +
+      (seasonName === 'Winter' && myRole === 'bloom' ? ' — planning season, replanning is free' : ''), 2.0);
+  }
+  lastSeasonIdx = s.seasonIdx;
   lastAnts = s.ants.length; lastDockTotal = dockT; lastRaining = s.raining;
+  lastMilestone = s.milestone;
+
+  // the year-end postcard — one shared beat of "look what we did"
+  if (s.postcard && s.postcard.id !== lastCard) {
+    lastCard = s.postcard.id;
+    const pc = s.postcard;
+    const el = $('postcard');
+    el.innerHTML = `<h2>Year ${pc.year} 🌼</h2>` +
+      `<p>${pc.antsFrom} → <b>${pc.antsTo}</b> ants · ${pc.harvests} garden harvests · ` +
+      `${pc.planted} flowers planted</p><p class="pcScore">⭐ ${pc.score}</p>`;
+    el.classList.remove('hidden');
+    snd.milestone();
+    setTimeout(() => el.classList.add('hidden'), 6000);
+  }
 
   for (const t of s.toasts) {
     if (seenToasts.has(t.id)) continue;
     seenToasts.add(t.id);
     if (t.role !== 'all' && t.role !== myRole) continue;
+    const box = $('toasts');
+    while (box.children.length >= 3) box.firstChild.remove();
     const div = document.createElement('div');
     div.className = 'toast' + (t.bad ? ' bad' : '');
     div.textContent = t.msg;
-    $('toasts').appendChild(div);
-    setTimeout(() => div.remove(), 5000);
+    box.appendChild(div);
+    setTimeout(() => div.remove(), t.bad ? 6000 : 4000);
     if (t.bad) snd.bad();
   }
 }
@@ -204,29 +281,21 @@ function forecast(s, seasonName) {
   }
   if (seasonName === 'Spring') return `🌱 Mild.${evTxt} · Summer in ${left}s`;
   if (seasonName === 'Summer') return `☀️ Peak season.${evTxt} · Autumn in ${left}s`;
-  if (seasonName === 'Autumn') return `🍂 Stormy.${evTxt} · ⚠ WINTER in ${left}s — recall in time!`;
-  return `❄️ ${left}s of frost left. Any ant outside is dying.`;
+  if (seasonName === 'Autumn') return `🍂 Stormy.${evTxt} · ⚠ WINTER in ${left}s — warn Burrow & recall!`;
+  return `❄️ ${left}s of frost — plan the spring tree, warn about the melt!`;
 }
 
 // ---------- orientation & canvas layout ----------
-// In portrait, Bloom's world is rotated 90° clockwise so the dock (the ant
-// pit) sits at the BOTTOM and the meadow stretches upward. Server coordinates
-// never change — this is pure presentation, so the two players can even use
-// different orientations.
 let portrait = false;
 function layoutCanvas() {
   portrait = window.innerHeight > window.innerWidth;
   if (!myRole) return;
   let w, h;
   if (myRole === 'bloom') { w = portrait ? 620 : 1000; h = portrait ? 1000 : 620; }
-  else { w = 464; h = 714; }   // 12×18 deep nest at 36px cells — portrait-shaped everywhere
+  else { w = 464; h = 714; }
   if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
   fitCanvas();
 }
-// letterbox the canvas into whatever the bars leave visible — the whole world
-// (especially the pit) must ALWAYS be on screen, never below the fold.
-// visualViewport is the truthful size inside in-app browsers (Telegram, iOS
-// Safari with collapsing chrome); innerHeight lies there.
 function vpW() { return (window.visualViewport && window.visualViewport.width) || window.innerWidth; }
 function vpH() { return (window.visualViewport && window.visualViewport.height) || window.innerHeight; }
 function barsHeight() {
@@ -247,7 +316,6 @@ function fitCanvas() {
 window.addEventListener('resize', layoutCanvas);
 window.addEventListener('orientationchange', () => setTimeout(layoutCanvas, 60));
 if (window.visualViewport) window.visualViewport.addEventListener('resize', () => layoutCanvas());
-// bars can grow/shrink (text wrap, season change) without any window resize
 let lastBarsH = -1;
 setInterval(() => {
   if (!myRole) return;
@@ -255,8 +323,8 @@ setInterval(() => {
   if (h !== lastBarsH) { lastBarsH = h; fitCanvas(); }
 }, 500);
 const rotBloom = () => portrait && myRole === 'bloom';
-function P(x, y) { return rotBloom() ? { x: 620 - y, y: x } : { x, y }; }        // world -> canvas
-function Winv(cx, cy) { return rotBloom() ? { x: cy, y: 620 - cx } : { x: cx, y: cy }; } // canvas -> world
+function P(x, y) { return rotBloom() ? { x: 620 - y, y: x } : { x, y }; }
+function Winv(cx, cy) { return rotBloom() ? { x: cy, y: 620 - cx } : { x: cx, y: cy }; }
 
 // ---------- rendering ----------
 function lerpState() {
@@ -274,9 +342,65 @@ function lerpState() {
   };
 }
 
+// ---------- juice: particles, floating text, banners (canvas coords) ----------
+let parts = [], floats = [], banner = null, lastFrameT = performance.now();
+function puff(x, y, color, n) {
+  for (let i = 0; i < (n || 10); i++) {
+    const a = Math.random() * Math.PI * 2, v = 30 + Math.random() * 80;
+    parts.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v - 30, life: 0.5 + Math.random() * 0.5, color });
+  }
+}
+function floatText(x, y, txt, color) { floats.push({ x, y, txt, color: color || '#fff7e6', life: 1.5 }); }
+function showBanner(txt, life) { banner = { txt, life: life || 3.5 }; }
+function confetti() {
+  const cols = ['#f3d34a', '#e8a0bf', '#7ba05b', '#8a5aa8'];
+  for (let i = 0; i < 60; i++) {
+    parts.push({
+      x: Math.random() * canvas.width, y: -10 - Math.random() * 40,
+      vx: (Math.random() - 0.5) * 40, vy: 60 + Math.random() * 120,
+      life: 1.5 + Math.random() * 1.5, color: cols[i % 4],
+    });
+  }
+}
+function drawJuice(dt) {
+  for (const p of parts) {
+    p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 90 * dt; p.life -= dt;
+    ctx.globalAlpha = Math.max(0, Math.min(1, p.life));
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x - 2, p.y - 2, 4, 4);
+  }
+  parts = parts.filter(p => p.life > 0);
+  ctx.globalAlpha = 1;
+  ctx.textAlign = 'center';
+  for (const f of floats) {
+    f.y -= 28 * dt; f.life -= dt;
+    ctx.globalAlpha = Math.max(0, Math.min(1, f.life));
+    ctx.font = 'bold 15px sans-serif';
+    ctx.strokeStyle = 'rgba(40,30,20,0.7)'; ctx.lineWidth = 3;
+    ctx.strokeText(f.txt, f.x, f.y);
+    ctx.fillStyle = f.color;
+    ctx.fillText(f.txt, f.x, f.y);
+  }
+  floats = floats.filter(f => f.life > 0);
+  if (banner) {
+    banner.life -= dt;
+    ctx.globalAlpha = Math.max(0, Math.min(1, banner.life));
+    ctx.font = 'bold 26px sans-serif';
+    ctx.strokeStyle = 'rgba(60,40,20,0.85)'; ctx.lineWidth = 5;
+    ctx.strokeText(banner.txt, canvas.width / 2, canvas.height * 0.25);
+    ctx.fillStyle = '#fff7e6';
+    ctx.fillText(banner.txt, canvas.width / 2, canvas.height * 0.25);
+    if (banner.life <= 0) banner = null;
+  }
+  ctx.globalAlpha = 1;
+}
+
 let lastWin = '';
 function frame() {
   requestAnimationFrame(frame);
+  const now = performance.now();
+  const fdt = Math.min(0.1, (now - lastFrameT) / 1000);
+  lastFrameT = now;
   const s = lerpState();
   if (!s || !myRole) return;
   const win = window.innerWidth + 'x' + window.innerHeight;
@@ -284,11 +408,116 @@ function frame() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   if (myRole === 'bloom') drawBloom(s);
   else drawBurrow(s);
+  drawJuice(fdt);
 }
 requestAnimationFrame(frame);
 
-// ----- Bloom -----
-let stroke = null; // {pts:[[x,y],...] in WORLD coords, attachId, attachIdx, len}
+// ----- Bloom: nodes & edges -----
+const DOCKP = { x: 975, y: 310 };
+function nodePos(s, id) {
+  if (id === 0) return DOCKP;
+  return s.sources.find(x => x.id === id) || null;
+}
+function nearestNode(s, x, y, maxD) {
+  let best = null, bestD = maxD;
+  const dd = Math.hypot(DOCKP.x - x, DOCKP.y - y);
+  if (dd < bestD) { bestD = dd; best = 0; }
+  for (const src of s.sources) {
+    const d = Math.hypot(src.x - x, src.y - y);
+    if (d < bestD) { bestD = d; best = src.id; }
+  }
+  return best;
+}
+function distToSeg(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay;
+  const L2 = dx * dx + dy * dy || 1;
+  const t = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / L2));
+  return Math.hypot(px - (ax + dx * t), py - (ay + dy * t));
+}
+function nearestEdge(s, x, y, maxD) {
+  let best = null, bestD = maxD;
+  for (const e of s.edges) {
+    const a = nodePos(s, e.a), b = nodePos(s, e.b);
+    if (!a || !b) continue;
+    const d = distToSeg(x, y, a.x, a.y, b.x, b.y);
+    if (d < bestD) { bestD = d; best = e.id; }
+  }
+  return best;
+}
+
+let pending = null;   // { from: nodeId, x, y (cursor, world coords), moved }
+let selNode = null;   // tap-tap flow: first selected node
+
+canvas.addEventListener('pointerdown', (ev) => {
+  if (ev.button !== 0 || !curr || myRole !== 'bloom') return;
+  ev.preventDefault();
+  const { x, y } = worldXY(ev);
+  if (eraseMode) {
+    const id = nearestEdge(curr, x, y, 20);
+    if (id !== null) {
+      cmd({ type: 'erase', id });
+      const e = curr.edges.find(ed => ed.id === id);
+      const cq = canvasXY(ev);
+      if (e) floatText(cq.x, cq.y - 10, `+${e.cost} 〰`, '#f3d34a');
+      snd.gate();
+    }
+    return;
+  }
+  if (plantMode) {
+    cmd({ type: 'plant', x: Math.round(x), y: Math.round(y) });
+    const cq = canvasXY(ev);
+    puff(cq.x, cq.y, '#7ba05b', 8);
+    floatText(cq.x, cq.y - 12, '🌰');
+    snd.draw();
+    return;
+  }
+  const at = nearestNode(curr, x, y, 42);
+  if (at !== null) {
+    pending = { from: at, x, y, moved: false };
+    canvas.setPointerCapture(ev.pointerId);
+    snd.draw();
+  } else {
+    selNode = null;
+  }
+});
+canvas.addEventListener('pointermove', (ev) => {
+  if (myRole !== 'bloom' || !pending) return;
+  const { x, y } = worldXY(ev);
+  pending.x = x; pending.y = y;
+  const from = nodePos(curr, pending.from);
+  if (from && Math.hypot(x - from.x, y - from.y) > 25) pending.moved = true;
+});
+canvas.addEventListener('pointerup', (ev) => {
+  if (myRole !== 'bloom' || !pending) return;
+  const { x, y } = worldXY(ev);
+  const at = nearestNode(curr, x, y, 42);
+  if (pending.moved) {
+    // drag flow: released on another node → lay the edge
+    if (at !== null && at !== pending.from) {
+      cmd({ type: 'edge', a: pending.from, b: at });
+      snd.draw();
+    }
+    selNode = null;
+  } else {
+    // tap flow: first tap selects, second tap connects
+    if (selNode !== null && at !== null && at !== selNode) {
+      cmd({ type: 'edge', a: selNode, b: at });
+      snd.draw();
+      selNode = null;
+    } else {
+      selNode = (at === selNode) ? null : at;
+    }
+  }
+  pending = null;
+});
+canvas.addEventListener('contextmenu', (ev) => {
+  ev.preventDefault();
+  if (myRole !== 'bloom' || !curr) return;
+  const { x, y } = worldXY(ev);
+  const id = nearestEdge(curr, x, y, 16);
+  if (id !== null) cmd({ type: 'erase', id });
+});
+
 function canvasXY(ev) {
   const rect = canvas.getBoundingClientRect();
   return {
@@ -300,89 +529,17 @@ function worldXY(ev) {
   const c = canvasXY(ev);
   return Winv(c.x, c.y);
 }
-function nearestTrailPoint(s, x, y, maxD) {
-  // only a stroke's OWN segment counts — branches copy their parent's prefix,
-  // and clicking the shared part should hit the parent, not the branch
-  let best = null, bestD = maxD;
-  for (const t of s.trails) {
-    for (let i = Math.max(0, (t.ownStart || 1) - 1); i < t.pts.length; i++) {
-      const p = t.pts[i];
-      const d = Math.hypot(p[0] - x, p[1] - y);
-      if (d < bestD) { bestD = d; best = { id: t.id, idx: i, x: p[0], y: p[1] }; }
-    }
-  }
-  return best;
-}
 
-canvas.addEventListener('pointerdown', (ev) => {
-  if (ev.button !== 0 || !curr) return;
-  if (myRole !== 'bloom') return;
-  ev.preventDefault();
-  const { x, y } = worldXY(ev);
-  if (eraseMode) {
-    const at = nearestTrailPoint(curr, x, y, 26);
-    if (at) cmd({ type: 'erase', id: at.id });
-    return;
-  }
-  const dock = { x: curr.world.w - 25, y: 310 };
-  if (Math.hypot(x - dock.x, y - dock.y) < 55) {
-    stroke = { pts: [[dock.x, dock.y]], attachId: null, attachIdx: 0, len: 0 };
-  } else {
-    const at = nearestTrailPoint(curr, x, y, 28);   // generous for fingers
-    if (at) stroke = { pts: [[at.x, at.y]], attachId: at.id, attachIdx: at.idx, len: 0 };
-    else return;
-  }
-  canvas.setPointerCapture(ev.pointerId);
-  snd.draw();
-});
-canvas.addEventListener('pointermove', (ev) => {
-  if (myRole !== 'bloom' || !stroke) return;
-  const { x, y } = worldXY(ev);
-  const last = stroke.pts[stroke.pts.length - 1];
-  const d = Math.hypot(x - last[0], y - last[1]);
-  if (d >= 12) {
-    stroke.pts.push([Math.round(x), Math.round(y)]);
-    stroke.len += d;
-  }
-});
-canvas.addEventListener('pointerup', () => {
-  if (myRole !== 'bloom' || !stroke) return;
-  if (stroke.pts.length >= 3) {
-    // magnet: if the stroke ends near a source, snap the tip onto it so the
-    // trail never misses its target by a few pixels
-    const last = stroke.pts[stroke.pts.length - 1];
-    let best = null, bd = 55;
-    for (const src of (curr ? curr.sources : [])) {
-      const d = Math.hypot(src.x - last[0], src.y - last[1]);
-      if (d < bd) { bd = d; best = src; }
-    }
-    if (best) stroke.pts.push([Math.round(best.x), Math.round(best.y)]);
-    cmd({
-      type: 'trail',
-      pts: stroke.pts.slice(1),          // server re-adds the anchor point
-      attachId: stroke.attachId,
-      attachIdx: stroke.attachIdx,
-    });
-  }
-  stroke = null;
-});
-canvas.addEventListener('contextmenu', (ev) => {
-  ev.preventDefault();
-  if (myRole !== 'bloom' || !curr) return;
-  const { x, y } = worldXY(ev);
-  const at = nearestTrailPoint(curr, x, y, 18);
-  if (at) cmd({ type: 'erase', id: at.id });
-});
-
-function polyPath(pts, from) {
-  // pts are world [x,y] pairs; map each through P()
-  const q0 = P(pts[from][0], pts[from][1]);
+// gentle arc between two points — trails read as living paths, not wires
+function drawArc(ax, ay, bx, by) {
+  const a = P(ax, ay), b = P(bx, by);
+  const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const L = Math.hypot(dx, dy) || 1;
+  const off = Math.min(18, L * 0.08);
   ctx.beginPath();
-  ctx.moveTo(q0.x, q0.y);
-  for (let i = from; i < pts.length; i++) {
-    const q = P(pts[i][0], pts[i][1]);
-    ctx.lineTo(q.x, q.y);
-  }
+  ctx.moveTo(a.x, a.y);
+  ctx.quadraticCurveTo(mx - dy / L * off, my + dx / L * off, b.x, b.y);
 }
 
 function drawBloom(s) {
@@ -398,65 +555,129 @@ function drawBloom(s) {
   if (seasonName === 'Winter') { ctx.fillStyle = 'rgba(235,243,250,0.6)'; ctx.fillRect(0, 0, canvas.width, canvas.height); }
   if (s.drought) { ctx.fillStyle = 'rgba(240,200,90,0.18)'; ctx.fillRect(0, 0, canvas.width, canvas.height); }
 
-  const dock = { x: s.world.w - 25, y: 310 };
-  const rot = rotBloom();
-
-  // trails: each stroke draws only its OWN segment with its own strength, so
-  // a well-fed trunk visibly thickens under the twigs that feed it
-  for (const t of s.trails) {
-    const from = Math.max(0, (t.ownStart || 1) - 1);
-    const alpha = 0.15 + 0.75 * Math.max(0, t.strength);
-    ctx.strokeStyle = t.food ? `rgba(120,60,140,${alpha})` : `rgba(110,90,90,${alpha * 0.8})`;
-    ctx.lineWidth = 2 + 5 * Math.max(0, t.strength);
-    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-    polyPath(t.pts, from);
-    ctx.stroke();
-    ctx.save();
-    ctx.setLineDash([3, 14]);
-    ctx.lineDashOffset = -performance.now() / 25;
-    ctx.strokeStyle = `rgba(255,240,255,${alpha * 0.8})`;
-    ctx.lineWidth = 2;
-    polyPath(t.pts, from);
-    ctx.stroke();
-    ctx.restore();
+  // the barren ring while planting: nothing grows on trampled earth
+  if (plantMode) {
+    const dq = P(DOCKP.x, DOCKP.y);
+    ctx.fillStyle = 'rgba(120,90,60,0.18)';
+    ctx.beginPath(); ctx.arc(dq.x, dq.y, s.plantMinDock, 0, 7); ctx.fill();
+    ctx.strokeStyle = 'rgba(120,90,60,0.5)'; ctx.setLineDash([6, 6]);
+    ctx.beginPath(); ctx.arc(dq.x, dq.y, s.plantMinDock, 0, 7); ctx.stroke();
+    ctx.setLineDash([]);
   }
-  // while drawing, show each source's pickup radius — anything inside counts
-  if (stroke) {
-    ctx.strokeStyle = 'rgba(120,60,140,0.35)';
-    ctx.setLineDash([3, 5]); ctx.lineWidth = 1.5;
-    for (const src of s.sources) {
-      const q = P(src.x, src.y);
-      ctx.beginPath(); ctx.arc(q.x, q.y, 40, 0, 7); ctx.stroke();
+
+  // edges — permanent, thickened by traffic, muddied by rain, gray as orphans
+  for (const e of s.edges) {
+    const a = nodePos(s, e.a), b = nodePos(s, e.b);
+    if (!a || !b) continue;
+    const w = 2.5 + 4 * Math.min(1, e.traffic);
+    if (e.orphan) {
+      ctx.strokeStyle = 'rgba(120,120,120,0.5)';
+      ctx.setLineDash([5, 7]);
+    } else if (s.mud) {
+      ctx.strokeStyle = 'rgba(80,60,45,0.75)';
+    } else {
+      ctx.strokeStyle = `rgba(120,60,140,${0.4 + 0.4 * Math.min(1, e.traffic)})`;
     }
-    ctx.setLineDash([]);
-  }
-  // stroke preview (stroke.pts are world coords)
-  if (stroke) {
-    const cost = Math.ceil(stroke.len / 10);
-    const ok = cost <= s.pher;
-    ctx.strokeStyle = ok ? 'rgba(120,60,140,0.9)' : 'rgba(200,60,40,0.9)';
-    ctx.setLineDash([6, 6]); ctx.lineWidth = 3;
-    polyPath(stroke.pts, 0);
+    ctx.lineWidth = w; ctx.lineCap = 'round';
+    drawArc(a.x, a.y, b.x, b.y);
     ctx.stroke();
     ctx.setLineDash([]);
-    const tipW = stroke.pts[stroke.pts.length - 1];
-    const tip = P(tipW[0], tipW[1]);
-    ctx.fillStyle = ok ? '#3a2e22' : '#a02020';
-    ctx.font = 'bold 13px sans-serif'; ctx.textAlign = 'center';
-    ctx.fillText(`${cost} 🟣`, tip.x, tip.y - 12);
+    // marching dots on live, trafficked trails
+    if (!e.orphan && e.traffic > 0.05 && seasonName !== 'Winter') {
+      ctx.save();
+      ctx.setLineDash([3, 16]);
+      ctx.lineDashOffset = -performance.now() / 30;
+      ctx.strokeStyle = 'rgba(255,240,255,0.7)';
+      ctx.lineWidth = 2;
+      drawArc(a.x, a.y, b.x, b.y);
+      ctx.stroke();
+      ctx.restore();
+    }
   }
 
-  // sources
+  // pending edge preview with live cost
+  const previewFrom = pending && pending.moved ? pending.from : selNode;
+  if (previewFrom !== null && previewFrom !== undefined) {
+    const from = nodePos(s, previewFrom);
+    if (from) {
+      let tx, ty;
+      if (pending && pending.moved) { tx = pending.x; ty = pending.y; }
+      const fq = P(from.x, from.y);
+      ctx.strokeStyle = '#f3d34a'; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.arc(fq.x, fq.y, 26 + 3 * Math.sin(performance.now() / 200), 0, 7); ctx.stroke();
+      if (tx !== undefined) {
+        const snap = nearestNode(s, tx, ty, 42);
+        const to = snap !== null && snap !== previewFrom ? nodePos(s, snap) : { x: tx, y: ty };
+        const len = Math.hypot(to.x - from.x, to.y - from.y);
+        const cost = Math.ceil(len / 150);
+        const ok = len <= 600 && cost <= s.seg.cap - s.seg.used;
+        ctx.strokeStyle = ok ? 'rgba(120,60,140,0.9)' : 'rgba(200,60,40,0.9)';
+        ctx.setLineDash([6, 6]); ctx.lineWidth = 3;
+        drawArc(from.x, from.y, to.x, to.y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        const tip = P(to.x, to.y);
+        ctx.fillStyle = ok ? '#3a2e22' : '#a02020';
+        ctx.font = 'bold 13px sans-serif'; ctx.textAlign = 'center';
+        ctx.fillText(len > 600 ? 'too far — hop through a node' : `${cost} 〰`, tip.x, tip.y - 14);
+      }
+    }
+  }
+
+  // sources: wild flowers, carcasses, planted flowers, sprouts, husks.
+  // Anything with food but no trail gets a soft pulsing ring — Bloom's
+  // to-do list, readable at a glance.
+  const linked = new Set([0]);
+  for (const e of s.edges) { linked.add(e.a); linked.add(e.b); }
+  const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 350);
   for (const src of s.sources) {
     const q = P(src.x, src.y);
+    if (src.amt > 0 && !linked.has(src.id)) {
+      ctx.strokeStyle = `rgba(255,250,235,${0.25 + 0.35 * pulse})`;
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(q.x, q.y, 22 + 3 * pulse, 0, 7); ctx.stroke();
+    }
+    if (src.dm) {
+      // a seed asleep under the snow — already a node you can wire trails to
+      ctx.strokeStyle = 'rgba(120,60,140,0.7)'; ctx.setLineDash([4, 4]);
+      ctx.beginPath(); ctx.arc(q.x, q.y, 14, 0, 7); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.font = '14px sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText('🌰', q.x, q.y + 5);
+      continue;
+    }
+    if (src.husk) {
+      ctx.strokeStyle = 'rgba(90,80,70,0.8)'; ctx.lineWidth = 2;
+      for (let l = 0; l < 3; l++) {
+        const ang = -Math.PI / 2 + (l - 1) * 0.5;
+        ctx.beginPath(); ctx.moveTo(q.x, q.y + 4);
+        ctx.lineTo(q.x + Math.cos(ang) * 10, q.y + 4 + Math.sin(ang) * 10); ctx.stroke();
+      }
+      continue;
+    }
+    if (src.sprout > 0) {
+      ctx.strokeStyle = '#4a6b2f'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(q.x, q.y + 6); ctx.lineTo(q.x, q.y - 4); ctx.stroke();
+      ctx.fillStyle = '#7ba05b';
+      ctx.beginPath(); ctx.ellipse(q.x - 4, q.y - 5, 5, 2.5, -0.5, 0, 7); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(q.x + 4, q.y - 5, 5, 2.5, 0.5, 0, 7); ctx.fill();
+      ctx.fillStyle = '#3a2e22'; ctx.font = '11px sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText(`${src.sprout}s`, q.x, q.y + 22);
+      continue;
+    }
     if (src.type === 'nectar') {
-      ctx.fillStyle = '#e8a0bf';
+      const dormant = src.pl && src.amt === 0;
+      ctx.fillStyle = src.pl ? (dormant ? '#b9a8b0' : '#f2b7d4') : '#e8a0bf';
       for (let p = 0; p < 5; p++) {
-        const ang = (p / 5) * Math.PI * 2;
+        const ang = (p / 5) * Math.PI * 2 + (src.pl ? performance.now() / 4000 : 0);
         ctx.beginPath(); ctx.arc(q.x + Math.cos(ang) * 8, q.y + Math.sin(ang) * 8, 6, 0, 7); ctx.fill();
       }
-      ctx.fillStyle = '#f3d34a';
+      ctx.fillStyle = dormant ? '#c9b98a' : '#f3d34a';
       ctx.beginPath(); ctx.arc(q.x, q.y, 6, 0, 7); ctx.fill();
+      if (src.pl) {   // a stem — planted flowers are yours
+        ctx.strokeStyle = '#4a6b2f'; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.moveTo(q.x, q.y + 8); ctx.lineTo(q.x, q.y + 16); ctx.stroke();
+      }
     } else {
       ctx.fillStyle = '#6b4a2f';
       ctx.beginPath(); ctx.ellipse(q.x, q.y, 14, 8, 0.4, 0, 7); ctx.fill();
@@ -465,11 +686,14 @@ function drawBloom(s) {
         ctx.beginPath(); ctx.moveTo(q.x + l * 5, q.y - 4); ctx.lineTo(q.x + l * 8, q.y - 13); ctx.stroke();
       }
     }
-    ctx.fillStyle = '#3a2e22'; ctx.font = '12px sans-serif'; ctx.textAlign = 'center';
-    ctx.fillText(src.amt, q.x, q.y + 32);
+    if (src.amt > 0) {
+      ctx.fillStyle = '#3a2e22'; ctx.font = '12px sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText(src.amt, q.x, q.y + 32);
+    }
   }
 
-  // dock — right edge in landscape, BOTTOM (the ant pit) in portrait
+  // dock strip + the pit
+  const rot = rotBloom();
   ctx.fillStyle = '#b98d5e';
   ctx.strokeStyle = 'rgba(90,60,30,0.4)';
   if (rot) {
@@ -483,28 +707,27 @@ function drawBloom(s) {
       ctx.beginPath(); ctx.moveTo(canvas.width - 46, y); ctx.lineTo(canvas.width, y); ctx.stroke();
     }
   }
-  // the pit itself — an unmissable hole into the earth where all trails start
-  const dq = P(dock.x, dock.y);
+  const dq = P(DOCKP.x, DOCKP.y);
   ctx.fillStyle = '#9a7a4a';
-  ctx.beginPath(); ctx.ellipse(dq.x, dq.y, 30, 22, 0, 0, 7); ctx.fill();      // dirt mound
+  ctx.beginPath(); ctx.ellipse(dq.x, dq.y, 30, 22, 0, 0, 7); ctx.fill();
   ctx.fillStyle = '#6b4a2f';
-  ctx.beginPath(); ctx.ellipse(dq.x, dq.y, 22, 15, 0, 0, 7); ctx.fill();      // inner rim
+  ctx.beginPath(); ctx.ellipse(dq.x, dq.y, 22, 15, 0, 0, 7); ctx.fill();
   ctx.fillStyle = '#241609';
-  ctx.beginPath(); ctx.ellipse(dq.x, dq.y, 15, 10, 0, 0, 7); ctx.fill();      // the hole
+  ctx.beginPath(); ctx.ellipse(dq.x, dq.y, 15, 10, 0, 0, 7); ctx.fill();
   ctx.strokeStyle = 'rgba(120,60,140,0.55)'; ctx.lineWidth = 3;
   ctx.beginPath(); ctx.arc(dq.x, dq.y, 34 + 5 * Math.sin(performance.now() / 400), 0, 7); ctx.stroke();
   ctx.fillStyle = '#3a2e22'; ctx.font = 'bold 14px sans-serif';
   if (rot) {
-    // label sits just ABOVE the dock strip so it never covers the hole
     ctx.textAlign = 'center';
-    ctx.fillText('drag from the hole to draw a trail ⤵', canvas.width / 2, canvas.height - 58);
+    ctx.fillText('the pit — tap it, then a source, to lay a trail ⤵', canvas.width / 2, canvas.height - 58);
   } else {
     ctx.save();
-    ctx.translate(canvas.width - 14, 350); ctx.rotate(Math.PI / 2); // starts below the hole
+    ctx.translate(canvas.width - 14, 350); ctx.rotate(Math.PI / 2);
     ctx.textAlign = 'left';
-    ctx.fillText('THE PIT — drag from the hole to draw a trail', 0, 0);
+    ctx.fillText('THE PIT — trails start here', 0, 0);
     ctx.restore();
   }
+  // goods waiting on the dock
   let pi = 0;
   for (const [type, color] of [['sugar', '#f3d34a'], ['protein', '#8a5a30']]) {
     for (let n = 0; n < s.dock[type]; n++, pi++) {
@@ -519,6 +742,12 @@ function drawBloom(s) {
     ctx.fillStyle = '#a02020'; ctx.font = 'bold 13px sans-serif'; ctx.textAlign = 'center';
     if (rot) ctx.fillText('JAM', 40, canvas.height - 52);
     else ctx.fillText('JAM', canvas.width - 23, 340);
+  }
+  // the seed ledge — Burrow's gifts arriving from below
+  for (let n = 0; n < s.seeds.ledge; n++) {
+    ctx.font = '15px sans-serif'; ctx.textAlign = 'center';
+    if (rot) ctx.fillText('🌰', canvas.width - 24 - n * 20, canvas.height - 54);
+    else ctx.fillText('🌰', canvas.width - 60, 290 - n * 20);
   }
 
   // ants (carry bitmask: 1 = sugar, 2 = protein)
@@ -550,7 +779,7 @@ function drawBloom(s) {
   } else rainDrops = [];
 }
 
-// ----- Burrow -----
+// ----- Burrow: bands, gardens, brood -----
 function burrowGeom(s) {
   const cell = Math.floor(Math.min((canvas.width - 20) / s.gridDim.cols, (canvas.height - 60) / s.gridDim.rows));
   return { cell, ox: Math.floor((canvas.width - cell * s.gridDim.cols) / 2), oy: 50 };
@@ -564,7 +793,6 @@ canvas.addEventListener('click', (ev) => {
   const c = Math.floor((x - geo.ox) / geo.cell);
   const r = Math.floor((y - geo.oy) / geo.cell);
   if (c < 0 || r < 0 || c >= curr.gridDim.cols || r >= curr.gridDim.rows) { queenSel = false; return; }
-  // tapping the queen selects her; the next tap sends her to a new chamber
   const qd = Math.hypot(c + 0.5 - curr.queen.x, r + 0.5 - curr.queen.y);
   if (queenSel) {
     queenSel = false;
@@ -573,9 +801,32 @@ canvas.addEventListener('click', (ev) => {
   }
   if (qd <= 0.8) { queenSel = true; return; }
   const ch = curr.grid[r][c];
-  if (ch === 'D' || ch === 'O') { cmd({ type: 'gate', c, r }); snd.gate(); return; }
+  // a garden answers the tap itself: harvest when ripe, seed when empty
+  // (Fill still wins so you can deliberately deconstruct)
+  if (ch === 'G' && tool !== 'fill') {
+    const gd = curr.gardens.find(g2 => g2.c === c && g2.r === r);
+    if (gd && gd.st >= curr.gardenStages) {
+      cmd({ type: 'harvest', c, r });
+      puff(x, y, '#d8905a', 14);
+      floatText(x, y - 10, '+3 🥩');
+      snd.harvest();
+    } else if (gd && gd.st === 0 && gd.pc === 0) {
+      cmd({ type: 'seedGarden', c, r });
+      puff(x, y, '#9a7ab0', 8);
+      floatText(x, y - 10, '🍄');
+      snd.draw();
+    }
+    return;
+  }
+  // a 🍼 nursery feeds on tap
+  if (ch === 'N' && tool !== 'fill' && curr.eggs.some(e => e.c === c && e.r === r && !e.f)) {
+    cmd({ type: 'feed', c, r });
+    floatText(x, y - 10, '🍼');
+    snd.deliver();
+    return;
+  }
   if (tool === 'dig') cmd({ type: 'dig', c, r });
-  else if (tool === 'egg') cmd({ type: 'egg', c, r });
+  else if (tool === 'fill') cmd({ type: 'fill', c, r });
   else cmd({ type: 'build', kind: tool, c, r });
 });
 let hover = null;
@@ -590,117 +841,150 @@ function drawBurrow(s) {
   const seasonName = s.seasons[s.seasonIdx].name;
   const geo = burrowGeom(s);
   const { cell, ox, oy } = geo;
+  const gw = s.gridDim.cols * cell;
 
   ctx.fillStyle = '#8a6844';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   ctx.fillStyle = seasonName === 'Winter' ? '#dfe9f2' : (s.raining ? '#8fa8bd' : '#bcd6e8');
   ctx.fillRect(0, 0, canvas.width, oy);
-  // the entrance shaft — visually punches through the sky strip
   ctx.fillStyle = '#241609';
   ctx.fillRect(ox + 2, oy - 14, cell - 4, 15);
   ctx.fillStyle = '#3a2e22'; ctx.font = 'bold 13px sans-serif'; ctx.textAlign = 'left';
-  ctx.fillText('⬆ DOCK' + (s.raining ? ' — 🌧 WATER COMING IN' : ''), ox + cell + 6, oy - 8);
+  ctx.fillText('⬆ DOCK' + (s.raining ? ' — 🌧' : ''), ox + cell + 6, oy - 8);
+
+  const stockAt = {};
+  for (const st of s.stocks) stockAt[st.c + ',' + st.r] = st;
+  const gardenAt = {};
+  for (const gd of s.gardens) gardenAt[gd.c + ',' + gd.r] = gd;
 
   for (let r = 0; r < s.gridDim.rows; r++) {
     for (let c = 0; c < s.gridDim.cols; c++) {
       const ch = s.grid[r][c];
       const x = ox + c * cell, y = oy + r * cell;
       if (ch === '#') {
-        ctx.fillStyle = r >= s.meltRow ? '#66492e' : '#7a5b3c';
+        ctx.fillStyle = r >= 14 ? '#5e4429' : '#7a5b3c';
         ctx.fillRect(x, y, cell - 1, cell - 1);
         continue;
       }
       ctx.fillStyle = '#453121';
       ctx.fillRect(x, y, cell - 1, cell - 1);
-      // water level fills from the bottom
-      const w = (+s.water[r][c]) / 9;
-      if (w > 0.02) {
-        ctx.fillStyle = 'rgba(64,130,180,0.85)';
-        const h = Math.min(1, w) * (cell - 1);
-        ctx.fillRect(x, y + (cell - 1) - h, cell - 1, h);
-      }
       if (ch === 'S') {
-        ctx.strokeStyle = '#f3d34a'; ctx.lineWidth = 2;
+        ctx.strokeStyle = '#c8a86a'; ctx.lineWidth = 2;
         ctx.strokeRect(x + 2, y + 2, cell - 5, cell - 5);
+        const st = stockAt[c + ',' + r];
+        if (st) {
+          let i = 0;
+          for (const [n, color] of [[st.s, '#f3d34a'], [st.p, '#b97a45']]) {
+            for (let k = 0; k < n && i < 10; k++, i++) {
+              const px = x + cell * 0.16 + (i % 5) * cell * 0.17;
+              const py = y + cell * (i < 5 ? 0.72 : 0.5);
+              ctx.fillStyle = color;
+              ctx.beginPath(); ctx.arc(px, py, cell * 0.06, 0, 7); ctx.fill();
+            }
+          }
+        }
       } else if (ch === 'N') {
         ctx.strokeStyle = '#e8a0bf'; ctx.lineWidth = 2;
         ctx.strokeRect(x + 2, y + 2, cell - 5, cell - 5);
-      } else if (ch === 'D' || ch === 'O') {
-        ctx.strokeStyle = '#c8a86a'; ctx.lineWidth = 3;
-        if (ch === 'D') {
-          ctx.fillStyle = '#9a7a4a';
-          ctx.fillRect(x + 3, y + 2, cell - 7, cell - 5);
-          ctx.strokeRect(x + 3, y + 2, cell - 7, cell - 5);
-          ctx.strokeStyle = '#6b4a2f';
-          ctx.beginPath(); ctx.moveTo(x + 4, y + cell / 2); ctx.lineTo(x + cell - 5, y + cell / 2); ctx.stroke();
-        } else {
-          ctx.strokeRect(x + 3, y + 2, cell - 7, cell - 5);
-        }
+      } else if (ch === 'G') {
+        ctx.strokeStyle = '#9a7ab0'; ctx.lineWidth = 2;
+        ctx.strokeRect(x + 2, y + 2, cell - 5, cell - 5);
+        const gd = gardenAt[c + ',' + r];
+        if (gd) drawGarden(gd, x, y, cell);
       }
     }
   }
 
-  ctx.strokeStyle = 'rgba(255,255,255,0.7)'; ctx.lineWidth = 1.5;
+  // the two climate lines — the whole strategy on two moving rulers
+  const fy = oy + s.frostRow * cell;
+  const dy = oy + s.dampRow * cell;
+  // soft tints so rooms and tunnels stay readable underneath the bands
+  ctx.fillStyle = 'rgba(220,235,248,0.20)';
+  ctx.fillRect(ox, oy, gw, Math.max(0, fy - oy));
+  ctx.fillStyle = 'rgba(70,120,170,0.20)';
+  ctx.fillRect(ox, dy, gw, Math.max(0, oy + s.gridDim.rows * cell - dy));
+  ctx.font = '11px sans-serif'; ctx.textAlign = 'right';
+  ctx.strokeStyle = 'rgba(230,240,250,0.95)'; ctx.setLineDash([6, 5]); ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(ox, fy); ctx.lineTo(ox + gw, fy); ctx.stroke();
+  ctx.strokeStyle = 'rgba(120,180,225,0.95)';
+  ctx.beginPath(); ctx.moveTo(ox, dy); ctx.lineTo(ox + gw, dy); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = 'rgba(235,244,252,0.95)';
+  ctx.fillText(seasonName === 'Winter' ? '❄ FROST — it creeps down all winter'
+    : (s.drought ? '☀ DRY — the drought bakes the shallows' : '❄ frost line'), ox + gw - 4, fy - 3);
+  ctx.fillStyle = 'rgba(180,215,240,0.95)';
+  ctx.fillText(seasonName === 'Spring' ? '💧 DAMP — it rises with the melt' : '💧 damp line', ox + gw - 4, dy - 3);
+
+  // dig / fill orders
+  ctx.lineWidth = 1.5;
   ctx.setLineDash([3, 3]);
   for (const d of s.digs) {
-    ctx.strokeRect(ox + d.c * cell + 3, oy + d.r * cell + 3, cell - 7, cell - 7);
+    const x = ox + d.c * cell, y = oy + d.r * cell;
+    ctx.strokeStyle = d.f ? 'rgba(200,140,80,0.95)' : 'rgba(255,255,255,0.7)';
+    ctx.strokeRect(x + 3, y + 3, cell - 7, cell - 7);
+    if (d.f) {
+      ctx.beginPath();
+      ctx.moveTo(x + 6, y + 6); ctx.lineTo(x + cell - 8, y + cell - 8);
+      ctx.moveTo(x + cell - 8, y + 6); ctx.lineTo(x + 6, y + cell - 8);
+      ctx.stroke();
+    }
   }
   ctx.setLineDash([]);
 
-  // eggs (progress ring; dimmed + 💤 when outside the queen's warmth)
+  // eggs: progress ring; 💤 out of warmth, ❄/💧 out of comfort, 🍼 hungry
+  const hungryCells = new Set();
   for (const e of s.eggs) {
     const siblings = s.eggs.filter(x => x.c === e.c && x.r === e.r);
     const idx = siblings.indexOf(e);
     const x = ox + e.c * cell + cell * 0.25 + idx * cell * 0.25;
     const y = oy + e.r * cell + cell * 0.68;
-    ctx.globalAlpha = e.w ? 1 : 0.45;
+    const stalled = !e.w || !e.f || !e.ok;
+    if (!e.f) hungryCells.add(e.c + ',' + e.r);
+    ctx.globalAlpha = stalled ? 0.45 : 1;
     ctx.fillStyle = '#f5efdc';
     ctx.beginPath(); ctx.ellipse(x, y, cell * 0.1, cell * 0.15, 0, 0, 7); ctx.fill();
     ctx.strokeStyle = '#e8a0bf'; ctx.lineWidth = 1.5;
     ctx.beginPath(); ctx.arc(x, y, cell * 0.18, -Math.PI / 2, -Math.PI / 2 + (e.t / 20) * Math.PI * 2); ctx.stroke();
     ctx.globalAlpha = 1;
-    if (!e.w) {
+    if (stalled && e.f) {
       ctx.fillStyle = 'rgba(200,225,245,0.95)'; ctx.font = `${Math.floor(cell * 0.3)}px sans-serif`; ctx.textAlign = 'center';
-      ctx.fillText('💤', x, y - cell * 0.25);
+      ctx.fillText(!e.ok
+        ? (e.r < s.frostRow ? (seasonName === 'Winter' ? '❄' : '☀') : '💧')
+        : (!e.w ? '💤' : ''), x, y - cell * 0.25);
     }
   }
+  for (const key of hungryCells) {
+    const [c, r] = key.split(',').map(Number);
+    const x = ox + c * cell, y = oy + r * cell;
+    const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 250);
+    ctx.strokeStyle = `rgba(243,211,74,${0.35 + 0.55 * pulse})`; ctx.lineWidth = 3;
+    ctx.strokeRect(x + 1, y + 1, cell - 3, cell - 3);
+    ctx.font = `${Math.floor(cell * 0.5)}px sans-serif`; ctx.textAlign = 'center';
+    ctx.fillText('🍼', x + cell / 2, y + cell * 0.45);
+  }
 
-  // the queen — a movable sprite: tap her, then tap a chamber to carry her
+  // the queen
   {
     const qx = ox + s.queen.x * cell, qy = oy + s.queen.y * cell;
     if (queenSel) {
       ctx.strokeStyle = 'rgba(232,160,191,0.55)'; ctx.setLineDash([4, 6]); ctx.lineWidth = 2;
-      ctx.beginPath(); ctx.arc(qx, qy, 3.5 * cell, 0, 7); ctx.stroke();  // brood-warmth radius
+      ctx.beginPath(); ctx.arc(qx, qy, 3.5 * cell, 0, 7); ctx.stroke();
       ctx.setLineDash([]);
       ctx.strokeStyle = '#f3d34a'; ctx.lineWidth = 3;
       ctx.beginPath(); ctx.arc(qx, qy, cell * 0.6 + 2 * Math.sin(performance.now() / 200), 0, 7); ctx.stroke();
       ctx.fillStyle = '#fff7e6'; ctx.font = 'bold 13px sans-serif'; ctx.textAlign = 'center';
-      ctx.fillText('tap a chamber to carry the queen there', ox + s.gridDim.cols * cell / 2, oy + cell * 0.6);
+      ctx.fillText('tap a chamber to carry the queen there', ox + gw / 2, oy + cell * 0.6);
     }
-    ctx.fillStyle = s.queenDanger && Math.floor(performance.now() / 250) % 2 ? '#c03030' : '#5a3050';
+    ctx.fillStyle = s.queenStress && Math.floor(performance.now() / 250) % 2 ? '#c03030' : '#5a3050';
     ctx.beginPath(); ctx.ellipse(qx, qy, cell * 0.38, cell * 0.27, 0, 0, 7); ctx.fill();
     ctx.fillStyle = '#f3d34a'; ctx.font = `${Math.floor(cell * 0.42)}px sans-serif`; ctx.textAlign = 'center';
     ctx.fillText('♛', qx, qy - cell * 0.15);
-  }
-
-  // guide lines — the frost line creeps downward through winter
-  const fy = oy + s.frostDepth * cell;
-  ctx.strokeStyle = 'rgba(230,240,250,0.9)'; ctx.setLineDash([6, 5]);
-  ctx.beginPath(); ctx.moveTo(ox, fy); ctx.lineTo(ox + s.gridDim.cols * cell, fy); ctx.stroke();
-  const my = oy + s.meltRow * cell;
-  ctx.strokeStyle = 'rgba(140,190,225,0.9)';
-  ctx.beginPath(); ctx.moveTo(ox, my); ctx.lineTo(ox + s.gridDim.cols * cell, my); ctx.stroke();
-  ctx.setLineDash([]);
-  ctx.font = '11px sans-serif'; ctx.textAlign = 'right';
-  ctx.fillStyle = 'rgba(235,244,252,0.95)';
-  ctx.fillText(seasonName === 'Winter' ? 'FROST — keep the queen & eggs below!' : 'frost line — creeps down in winter',
-    ox + s.gridDim.cols * cell - 4, fy - 3);
-  ctx.fillStyle = 'rgba(180,215,240,0.95)';
-  ctx.fillText('groundwater — digs below here seep in spring', ox + s.gridDim.cols * cell - 4, my - 3);
-
-  if (seasonName === 'Winter') {
-    ctx.fillStyle = 'rgba(220,235,248,0.35)';
-    ctx.fillRect(ox, oy, s.gridDim.cols * cell, s.frostDepth * cell);
+    if (s.queenHP < 100) {
+      ctx.fillStyle = 'rgba(0,0,0,0.45)';
+      ctx.fillRect(qx - cell * 0.5, qy - cell * 0.66, cell, 5);
+      ctx.fillStyle = s.queenHP > 50 ? '#7ba05b' : '#c05030';
+      ctx.fillRect(qx - cell * 0.5, qy - cell * 0.66, cell * s.queenHP / 100, 5);
+    }
   }
 
   for (const a of s.ants) {
@@ -722,5 +1006,44 @@ function drawBurrow(s) {
   if (hover && hover.c >= 0 && hover.r >= 0 && hover.c < s.gridDim.cols && hover.r < s.gridDim.rows) {
     ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
     ctx.strokeRect(ox + hover.c * cell + 1, oy + hover.r * cell + 1, cell - 3, cell - 3);
+  }
+}
+
+// a garden cell: bare soil → sprouting caps → ripe glow (tap to harvest)
+function drawGarden(gd, x, y, cell) {
+  const cx = x + cell / 2;
+  if (gd.st === 0 && gd.pc === 0) {
+    // tilled, unseeded — dark furrows
+    ctx.strokeStyle = 'rgba(150,120,160,0.5)'; ctx.lineWidth = 1.5;
+    for (let i = 1; i <= 3; i++) {
+      ctx.beginPath(); ctx.moveTo(x + 5, y + (cell * i) / 4); ctx.lineTo(x + cell - 6, y + (cell * i) / 4); ctx.stroke();
+    }
+    ctx.fillStyle = 'rgba(220,200,230,0.8)'; ctx.font = `${Math.floor(cell * 0.34)}px sans-serif`; ctx.textAlign = 'center';
+    ctx.fillText('🍄?', cx, y + cell * 0.62);
+    return;
+  }
+  const ripe = gd.st >= 4;
+  const n = Math.min(3, Math.max(1, gd.st));         // caps shown
+  const size = cell * (0.10 + 0.05 * gd.st);         // caps grow with stage
+  for (let i = 0; i < n; i++) {
+    const px = x + cell * (0.28 + i * 0.24);
+    const py = y + cell * 0.66;
+    ctx.strokeStyle = '#d8cfc0'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(px, py - size); ctx.stroke();
+    ctx.fillStyle = ripe ? '#d8905a' : '#b0889a';
+    ctx.beginPath(); ctx.arc(px, py - size, size * 0.8, Math.PI, 0); ctx.fill();
+  }
+  if (ripe) {
+    const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 300);
+    ctx.strokeStyle = `rgba(243,211,74,${0.3 + 0.5 * pulse})`; ctx.lineWidth = 3;
+    ctx.strokeRect(x + 1, y + 1, cell - 3, cell - 3);
+  } else if (gd.st > 0 && !gd.ok) {
+    ctx.font = `${Math.floor(cell * 0.32)}px sans-serif`; ctx.textAlign = 'center';
+    ctx.fillText('⏸', cx, y + cell * 0.3);
+  }
+  // harvested pieces waiting for a hauler
+  ctx.fillStyle = '#b97a45';
+  for (let i = 0; i < gd.pc; i++) {
+    ctx.beginPath(); ctx.arc(x + cell * 0.2 + i * cell * 0.15, y + cell * 0.85, cell * 0.06, 0, 7); ctx.fill();
   }
 }

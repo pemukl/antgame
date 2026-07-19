@@ -15,6 +15,10 @@ const PORT = process.env.PORT || 8420;
 const WEB = path.join(__dirname, '..', 'web');
 const TICK = 0.05;           // 20 Hz simulation
 const BROADCAST_EVERY = 1;   // broadcast every tick
+// dev flags for visual testing: DEMO=1 runs bots on BOTH roles (alongside any
+// humans — watch or interfere), SPEED=N fast-forwards the simulation clock
+const DEMO = !!process.env.DEMO;
+const SPEED = Math.max(0.1, +(process.env.SPEED || 1));
 
 let game = createGame();
 // role -> { token, res (open SSE response or null), joinedAt, everConnected }
@@ -148,7 +152,7 @@ const server = http.createServer(async (req, res) => {
     return sendJSON(res, 200, {
       roles: { bloom: roleStatus('bloom'), burrow: roleStatus('burrow') },
       gameOver: game.gameOver,
-      trails: game.trails.length, ants: game.ants.length, // handy for headless tests
+      edges: game.edges.length, ants: game.ants.length, // handy for headless tests
     });
   }
 
@@ -168,7 +172,8 @@ const server = http.createServer(async (req, res) => {
 setInterval(() => {
   const sb = roleStatus('bloom'), su = roleStatus('burrow');
   // run when both seats are filled AND at least one is a live human
-  const both = sb !== 'free' && su !== 'free' && (connected('bloom') || connected('burrow'));
+  const anyHuman = connected('bloom') || connected('burrow');
+  const both = DEMO ? anyHuman : (sb !== 'free' && su !== 'free' && anyHuman);
   if (both && !wasBothConnected && !game.gameOver && Date.now() - lastPairToast > 30000) {
     lastPairToast = Date.now();
     game.toasts.push({ id: Date.now(), msg: 'Both players connected — the colony stirs!', bad: false, role: 'all' });
@@ -176,10 +181,14 @@ setInterval(() => {
   }
   wasBothConnected = both;
   if (both && !game.gameOver) {
-    for (const r of ['bloom', 'burrow']) {
-      if (players[r] && players[r].bot && botStates[r]) bot.act(game, r, botStates[r], TICK);
+    // SPEED fast-forwards by running whole sub-ticks — same fidelity as 1×
+    for (let i = 0; i < Math.round(SPEED) && !game.gameOver; i++) {
+      for (const r of ['bloom', 'burrow']) {
+        if (DEMO && !botStates[r]) botStates[r] = bot.newBotState();
+        if ((DEMO || (players[r] && players[r].bot)) && botStates[r]) bot.act(game, r, botStates[r], TICK);
+      }
+      tick(game, TICK);
     }
-    tick(game, TICK);
   }
 
   const state = publicState(game);
